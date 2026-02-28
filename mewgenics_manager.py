@@ -26,6 +26,12 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QBrush, QAction, QPalette
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _valid_str(s) -> bool:
+    """Reject None, empty, and the literal string 'none' the game uses as a filler."""
+    return bool(s) and s.strip().lower() not in ("none", "null", "")
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 STAT_NAMES = ["STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK"]
@@ -198,13 +204,13 @@ class Cat:
         if found != -1:
             r.seek(found)
 
-        self.abilities = [a for a in [r.str() for _ in range(6)] if a]
-        self.equipment = [s for s in [r.str() for _ in range(4)] if s]
+        self.abilities = [a for a in [r.str() for _ in range(6)] if _valid_str(a)]
+        self.equipment = [s for s in [r.str() for _ in range(4)] if _valid_str(s)]
 
         # Mutations (up to 14 slots)
         self.mutations = []
         first = r.str()
-        if first:
+        if _valid_str(first):
             self.mutations.append(first)
         for _ in range(13):
             if r.remaining() < 12:
@@ -213,7 +219,7 @@ class Cat:
             if flag == 0:
                 break
             p = r.str()
-            if p:
+            if _valid_str(p):
                 self.mutations.append(p)
 
     # ── Display helpers ────────────────────────────────────────────────────
@@ -273,6 +279,23 @@ def get_grandparents(cat: Cat) -> list[Cat]:
     for p in get_parents(cat):
         gp.extend(get_parents(p))
     return gp
+
+
+def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
+    """Return (ok, reason). reason is non-empty only when ok is False."""
+    if a is b:
+        return False, "Cannot pair a cat with itself"
+    ga, gb = a.gender_display, b.gender_display
+    # Ditto ("?") can pair with anything
+    if ga == "?" or gb == "?":
+        return True, ""
+    if ga == "M" and gb == "F":
+        return True, ""
+    if ga == "F" and gb == "M":
+        return True, ""
+    # Same sex
+    label = "female" if ga == "F" else "male"
+    return False, f"Both cats are {label} — cannot produce offspring"
 
 
 # ── Save-file helpers ─────────────────────────────────────────────────────────
@@ -539,10 +562,11 @@ class CatDetailPanel(QWidget):
             self.setFixedHeight(0)
             return
 
-        self.setFixedHeight(180)
         if len(cats) == 1:
+            self.setFixedHeight(180)
             self._build_single(cats[0])
         else:
+            self.setFixedHeight(240)
             self._build_pair(cats[0], cats[1])
 
     # ── Single cat ─────────────────────────────────────────────────────────
@@ -629,95 +653,152 @@ class CatDetailPanel(QWidget):
     # ── Breeding pair ──────────────────────────────────────────────────────
 
     def _build_pair(self, a: Cat, b: Cat):
-        root = QHBoxLayout(self._content)
+        from PySide6.QtWidgets import QGridLayout
+        ok, reason = can_breed(a, b)
+
+        root = QVBoxLayout(self._content)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(16)
+        root.setSpacing(6)
 
-        # Parent names
+        # ── Row 1: header ──────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+
         for cat in (a, b):
-            col = QVBoxLayout(); col.setSpacing(2)
-            nl = QLabel(f"{cat.name}  {cat.gender_display}"); nl.setStyleSheet(_NAME_STYLE)
-            rl = QLabel(cat.room_display or "—"); rl.setStyleSheet(_META_STYLE)
-            col.addWidget(nl); col.addWidget(rl); col.addStretch()
-            root.addLayout(col)
+            nl = QLabel(f"{cat.name}  {cat.gender_display}")
+            nl.setStyleSheet(_NAME_STYLE)
+            hdr.addWidget(nl)
+            rl = QLabel(cat.room_display or "—")
+            rl.setStyleSheet(_META_STYLE)
+            hdr.addWidget(rl)
+            if cat is not b:
+                x = QLabel("×"); x.setStyleSheet("color:#444; font-size:13px; padding:0 6px;")
+                hdr.addWidget(x)
 
-        root.addWidget(_vsep())
+        hdr.addStretch()
 
-        # Stat comparison
-        sc = QVBoxLayout(); sc.setSpacing(2)
-        sc.addWidget(_sec("OFFSPRING  (base range)"))
-        sg = QHBoxLayout(); sg.setSpacing(10)
-        for stat in STAT_NAMES:
-            va = a.base_stats[stat]; vb = b.base_stats[stat]
-            lo, hi = min(va, vb), max(va, vb)
-            cell = QVBoxLayout(); cell.setSpacing(1)
+        if not ok:
+            err = QLabel(f"⚠  {reason}")
+            err.setStyleSheet(_WARN_STYLE)
+            hdr.addWidget(err)
 
-            hdr = QLabel(stat)
-            hdr.setStyleSheet("color:#555; font-size:9px; font-weight:bold;")
-            hdr.setAlignment(Qt.AlignCenter)
+        root.addLayout(hdr)
 
-            bc = STAT_COLORS.get(hi, QColor(100, 100, 115))
-            vl = QLabel(f"{lo}–{hi}" if lo != hi else str(lo))
-            vl.setAlignment(Qt.AlignCenter)
-            vl.setStyleSheet(f"color:rgb({bc.red()},{bc.green()},{bc.blue()});"
-                             f"font-size:12px; font-weight:bold;")
+        if not ok:
+            root.addStretch()
+            return
 
-            if va != vb:
-                winner = (a if va > vb else b).short_name
-                wl = QLabel(f"↑{winner}"); wl.setStyleSheet("color:#5a9; font-size:9px;")
-            else:
-                wl = QLabel("tie"); wl.setStyleSheet("color:#444; font-size:9px;")
-            wl.setAlignment(Qt.AlignCenter)
+        # ── Row 2: stats grid + abilities ──────────────────────────────────
+        mid = QHBoxLayout()
+        mid.setSpacing(16)
 
-            cell.addWidget(hdr); cell.addWidget(vl); cell.addWidget(wl)
-            sg.addLayout(cell)
-        sc.addLayout(sg); sc.addStretch()
-        root.addLayout(sc)
+        # Stats grid (4 rows × 8 cols: label + 7 stats)
+        grid_w = QWidget()
+        grid = QGridLayout(grid_w)
+        grid.setSpacing(3)
+        grid.setContentsMargins(0, 0, 0, 0)
 
-        # Combined mutations
+        # Column headers
+        for j, stat in enumerate(STAT_NAMES):
+            h = QLabel(stat)
+            h.setStyleSheet("color:#555; font-size:9px; font-weight:bold;")
+            h.setAlignment(Qt.AlignCenter)
+            grid.addWidget(h, 0, j + 1)
+
+        # Cat A row, Offspring row, Cat B row
+        rows = [
+            (a.short_name, a),
+            ("Offspring", None),
+            (b.short_name, b),
+        ]
+        for i, (label, cat) in enumerate(rows):
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color:#777; font-size:10px;")
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(lbl, i + 1, 0)
+
+            for j, stat in enumerate(STAT_NAMES):
+                if cat is not None:
+                    val = cat.base_stats[stat]
+                    c   = STAT_COLORS.get(val, QColor(100, 100, 115))
+                    cell = QLabel(str(val))
+                    cell.setAlignment(Qt.AlignCenter)
+                    cell.setStyleSheet(
+                        f"background:rgb({c.red()},{c.green()},{c.blue()});"
+                        f"color:#fff; font-size:11px; font-weight:bold;"
+                        f"border-radius:2px; padding:1px 5px;")
+                else:
+                    va, vb = a.base_stats[stat], b.base_stats[stat]
+                    lo, hi = min(va, vb), max(va, vb)
+                    c    = STAT_COLORS.get(hi, QColor(100, 100, 115))
+                    text = f"{lo}–{hi}" if lo != hi else str(lo)
+                    cell = QLabel(text)
+                    cell.setAlignment(Qt.AlignCenter)
+                    cell.setStyleSheet(
+                        f"color:rgb({c.red()},{c.green()},{c.blue()});"
+                        f"font-size:11px; font-weight:bold;")
+                grid.addWidget(cell, i + 1, j + 1)
+
+        mid.addWidget(grid_w)
+        mid.addWidget(_vsep())
+
+        # Abilities (both cats, non-empty only)
+        ab_col = QVBoxLayout(); ab_col.setSpacing(4)
+        ab_col.addWidget(_sec("ABILITIES"))
+        any_ab = False
+        for cat in (a, b):
+            if cat.abilities:
+                row = QHBoxLayout(); row.setSpacing(4)
+                lbl = QLabel(f"{cat.short_name}:")
+                lbl.setStyleSheet("color:#555; font-size:10px;")
+                row.addWidget(lbl)
+                for ab in cat.abilities:
+                    row.addWidget(_chip(ab))
+                row.addStretch()
+                ab_col.addLayout(row)
+                any_ab = True
+        if not any_ab:
+            ab_col.addWidget(QLabel("none", styleSheet=_META_STYLE))
+        ab_col.addStretch()
+        mid.addLayout(ab_col)
+
+        root.addLayout(mid)
+
+        # ── Row 3: possible mutations + lineage ────────────────────────────
+        bot = QHBoxLayout(); bot.setSpacing(16)
+
         all_muts = list(dict.fromkeys(a.mutations + b.mutations))
         if all_muts:
-            root.addWidget(_vsep())
             mc = QVBoxLayout(); mc.setSpacing(4)
-            mc.addWidget(_sec("MUTATIONS"))
+            mc.addWidget(_sec("POSSIBLE MUTATIONS"))
             mc.addWidget(ChipRow(all_muts))
             mc.addStretch()
-            root.addLayout(mc)
+            bot.addLayout(mc)
+            bot.addWidget(_vsep())
 
-        # Lineage safety
-        root.addWidget(_vsep())
-        lc = QVBoxLayout(); lc.setSpacing(4)
+        # Lineage check
+        lc = QVBoxLayout(); lc.setSpacing(3)
         lc.addWidget(_sec("LINEAGE"))
-        common = find_common_ancestors(a, b)
-
-        # Also check direct parent/child relationship
+        common    = find_common_ancestors(a, b)
         is_direct = (a in get_parents(b) or b in get_parents(a))
 
         if is_direct:
-            ll = QLabel("⚠  Direct parent/offspring")
-            ll.setStyleSheet(_WARN_STYLE)
-            lc.addWidget(ll)
+            lc.addWidget(QLabel("⚠  Direct parent/offspring", styleSheet=_WARN_STYLE))
         elif common:
-            ll = QLabel(f"⚠  {len(common)} shared ancestor{'s' if len(common) > 1 else ''}")
-            ll.setStyleSheet(_WARN_STYLE)
-            lc.addWidget(ll)
-            names_lbl = QLabel("  ·  ".join(c.short_name for c in common[:6]))
-            names_lbl.setStyleSheet("color:#a06040; font-size:10px;")
-            lc.addWidget(names_lbl)
+            lc.addWidget(QLabel(
+                f"⚠  {len(common)} shared ancestor{'s' if len(common) > 1 else ''}: "
+                + "  ·  ".join(c.short_name for c in common[:6]),
+                styleSheet=_WARN_STYLE))
+        elif get_parents(a) or get_parents(b):
+            lc.addWidget(QLabel("✓  No shared ancestors", styleSheet=_SAFE_STYLE))
         else:
-            parents_known = bool(get_parents(a) or get_parents(b))
-            if parents_known:
-                ll = QLabel("✓  No shared ancestors")
-                ll.setStyleSheet(_SAFE_STYLE)
-            else:
-                ll = QLabel("—  Lineage unknown (founding cats)")
-                ll.setStyleSheet(_META_STYLE)
-            lc.addWidget(ll)
+            lc.addWidget(QLabel("—  Lineage unknown", styleSheet=_META_STYLE))
 
         lc.addStretch()
-        root.addLayout(lc)
+        bot.addLayout(lc)
+        bot.addStretch()
 
-        root.addStretch()
+        root.addLayout(bot)
 
 
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
