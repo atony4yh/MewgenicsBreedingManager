@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QFileDialog, QHeaderView,
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
+    QLineEdit,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -647,7 +648,7 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Source"]
+COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Source", "Inbr"]
 COL_NAME  = 0
 COL_GEN   = 1
 COL_ROOM  = 2
@@ -657,6 +658,7 @@ COL_SUM   = 11
 COL_ABIL  = 12
 COL_MUTS  = 13
 COL_SRC   = 14
+COL_INB   = 15
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
@@ -715,8 +717,14 @@ class CatTableModel(QAbstractTableModel):
                 pa, pb = cat.parent_a, cat.parent_b
                 if pa is None and pb is None:
                     return "Stray"
-                parts = [p.name for p in (pa, pb) if p is not None]
-                return " × ".join(parts)
+                def _pname(p):
+                    return p.name if p.status != "Gone" else f"{p.name} (gone)"
+                return " × ".join(_pname(p) for p in (pa, pb) if p is not None)
+            if col == COL_INB:
+                if cat.parent_a is None or cat.parent_b is None:
+                    return "—"
+                score = len(find_common_ancestors(cat.parent_a, cat.parent_b))
+                return str(score) if score else "—"
 
         elif role == Qt.UserRole:
             if col in STAT_COLS:
@@ -745,6 +753,13 @@ class CatTableModel(QAbstractTableModel):
                 if compat == 'risky':
                     return QBrush(QColor(sc.red() // 2, sc.green() // 2, sc.blue() // 2))
                 return QBrush(sc)
+            if col == COL_INB:
+                if cat.parent_a is not None and cat.parent_b is not None:
+                    score = len(find_common_ancestors(cat.parent_a, cat.parent_b))
+                    if score >= 3:
+                        return QBrush(QColor(80, 20, 20))
+                    if score >= 1:
+                        return QBrush(QColor(70, 55, 10))
             if compat == 'incompatible':
                 return QBrush(QColor(18, 12, 14))
             if compat == 'risky':
@@ -791,15 +806,22 @@ class RoomFilterModel(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self._room = None
+        self._name_filter = ""
         self.setSortRole(Qt.UserRole)
 
     def set_room(self, key):
         self._room = key
-        self.invalidate()   # invalidateFilter() is deprecated in Qt6
+        self.invalidate()
+
+    def set_name_filter(self, text: str):
+        self._name_filter = text.strip().lower()
+        self.invalidate()
 
     def filterAcceptsRow(self, source_row, source_parent):
         cat = self.sourceModel().cat_at(source_row)
         if cat is None:
+            return False
+        if self._name_filter and self._name_filter not in cat.name.lower():
             return False
         if self._room == "__all__":
             return True
@@ -908,14 +930,27 @@ class CatDetailPanel(QWidget):
         id_col.addLayout(name_row)
         id_col.addWidget(QLabel(cat.room_display or "—", styleSheet=_META_STYLE))
 
-        # Stat bonuses (only if total differs from base)
-        diffs = [(n, cat.base_stats[n], cat.total_stats[n])
-                 for n in STAT_NAMES if cat.total_stats[n] != cat.base_stats[n]]
-        if diffs:
+        # Stats: show all 7; highlight any that are modified
+        has_mods = any(cat.total_stats[n] != cat.base_stats[n] for n in STAT_NAMES)
+        if has_mods:
             id_col.addSpacing(4)
-            dl = QLabel("  ".join(f"{n} {b}→{t}" for n, b, t in diffs))
-            dl.setStyleSheet("color:#5a9; font-size:11px;")
-            id_col.addWidget(dl)
+            stat_row = QHBoxLayout(); stat_row.setSpacing(6)
+            for n in STAT_NAMES:
+                base = cat.base_stats[n]
+                total = cat.total_stats[n]
+                if total != base:
+                    delta = total - base
+                    sign  = "+" if delta > 0 else ""
+                    text  = f"{n} {base}{sign}{delta}"
+                    col_s = "#5a9" if delta > 0 else "#c55"
+                else:
+                    text  = f"{n} {base}"
+                    col_s = "#555"
+                lbl = QLabel(text)
+                lbl.setStyleSheet(f"color:{col_s}; font-size:10px;")
+                stat_row.addWidget(lbl)
+            stat_row.addStretch()
+            id_col.addLayout(stat_row)
 
         def _navigate(target: Cat):
             mw = self.window()
@@ -1501,9 +1536,19 @@ class MainWindow(QMainWindow):
         self._count_lbl.setStyleSheet("color:#555; font-size:12px; padding-left:8px;")
         self._summary_lbl = QLabel("")
         self._summary_lbl.setStyleSheet("color:#4a7a9a; font-size:11px;")
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search…")
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedWidth(180)
+        self._search.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:3px 8px; font-size:12px; }"
+            "QLineEdit:focus { border-color:#3a3a7a; }")
         hb.addWidget(self._header_lbl)
         hb.addWidget(self._count_lbl)
         hb.addStretch()
+        hb.addWidget(self._search)
+        hb.addSpacing(12)
         hb.addWidget(self._summary_lbl)
         vb.addWidget(hdr)
 
@@ -1557,8 +1602,12 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(COL_MUTS, QHeaderView.Interactive)
         self._table.setColumnWidth(COL_MUTS, 155)
 
-        # Source: Stretch — rightmost column absorbs blank space
+        # Source: Stretch — absorbs blank space
         hh.setSectionResizeMode(COL_SRC, QHeaderView.Stretch)
+
+        # Inbreeding score: fixed narrow column at far right
+        hh.setSectionResizeMode(COL_INB, QHeaderView.Fixed)
+        self._table.setColumnWidth(COL_INB, 38)
 
         self._table.setStyleSheet("""
             QTableView {
@@ -1581,6 +1630,8 @@ class MainWindow(QMainWindow):
         """)
 
         self._table.selectionModel().selectionChanged.connect(self._on_selection)
+        self._search.textChanged.connect(self._proxy_model.set_name_filter)
+        self._search.textChanged.connect(self._update_count)
         vs.addWidget(self._table)
 
         # Detail panel
