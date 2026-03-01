@@ -582,7 +582,10 @@ def _parse_pedigree(conn) -> dict:
             continue
         pa = int(pa_k) if pa_k != NULL and 0 < pa_k <= MAX_KEY else None
         pb = int(pb_k) if pb_k != NULL and 0 < pb_k <= MAX_KEY else None
-        ped_map[int(cat_k)] = (pa, pb)
+        # First occurrence of each cat_k is the parent record; later occurrences
+        # are other relationship types (breeding history, etc.) — skip them.
+        if int(cat_k) not in ped_map:
+            ped_map[int(cat_k)] = (pa, pb)
 
     return ped_map
 
