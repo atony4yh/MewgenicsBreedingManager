@@ -401,7 +401,7 @@ class Cat:
         if self.gender not in ("male", "female"):
             try:
                 sex_u16 = struct.unpack_from('<H', raw, _name_end + 8)[0]
-                self.gender = {1: "male", 2: "female"}.get(sex_u16, "?")
+                self.gender = {1: "male", 2: "female"}.get(sex_u16, "female")
             except Exception:
                 pass
 
@@ -418,8 +418,7 @@ class Cat:
         g = (self.gender or "").strip().lower()
         if g.startswith("male"):   return "M"
         if g.startswith("female"): return "F"
-        if g in ("ditto", "?"):    return "?"
-        return g[:1].upper() if g else "?"
+        return "F"  # unknown/ditto defaults to F
 
     @property
     def can_move(self) -> bool:
@@ -469,9 +468,6 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
     if a is b:
         return False, "Cannot pair a cat with itself"
     ga, gb = a.gender_display, b.gender_display
-    # Ditto ("?") can pair with anything
-    if ga == "?" or gb == "?":
-        return True, ""
     if ga == "M" and gb == "F":
         return True, ""
     if ga == "F" and gb == "M":
