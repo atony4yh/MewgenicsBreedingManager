@@ -28,7 +28,7 @@ from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
     QFileSystemWatcher, QItemSelectionModel,
 )
-from PySide6.QtGui import QColor, QBrush, QAction, QPalette
+from PySide6.QtGui import QColor, QBrush, QAction, QPalette, QFont, QKeySequence
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -717,6 +717,52 @@ def get_all_ancestors(cat: Optional[Cat], depth: int = 6, _seen: set = None) -> 
     return ancestors
 
 
+def _ancestor_depths(cat: Optional[Cat], max_depth: int = 8) -> dict[Cat, int]:
+    """
+    Return a map of ancestor -> generational distance.
+    Includes `cat` itself at depth 0, then parents at depth 1, etc.
+    """
+    if cat is None:
+        return {}
+    depths: dict[Cat, int] = {cat: 0}
+    frontier: list[tuple[Cat, int]] = [(cat, 0)]
+    while frontier:
+        cur, d = frontier.pop(0)
+        if d >= max_depth:
+            continue
+        for parent in (cur.parent_a, cur.parent_b):
+            if parent is None:
+                continue
+            nd = d + 1
+            prev = depths.get(parent)
+            if prev is None or nd < prev:
+                depths[parent] = nd
+                frontier.append((parent, nd))
+    return depths
+
+
+def relation_percent(a: Optional[Cat], b: Optional[Cat], max_depth: int = 8) -> float:
+    """
+    Approximate relatedness (0-100) from shared lineage.
+    Uses a relationship-coefficient style sum:
+      contribution = 0.5 ** (depth_from_a + depth_from_b)
+    across all shared ancestors (including each cat itself at depth 0).
+    """
+    if a is None or b is None:
+        return 0.0
+    if a is b:
+        return 100.0
+    da = _ancestor_depths(a, max_depth=max_depth)
+    db = _ancestor_depths(b, max_depth=max_depth)
+    common = set(da.keys()) & set(db.keys())
+    if not common:
+        return 0.0
+    coef = 0.0
+    for anc in common:
+        coef += 0.5 ** (da[anc] + db[anc])
+    return max(0.0, min(100.0, coef * 100.0))
+
+
 def find_common_ancestors(a: Cat, b: Cat) -> list[Cat]:
     """Return cats that appear in both ancestry trees."""
     return list(get_all_ancestors(a) & get_all_ancestors(b))
@@ -938,7 +984,7 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Gen", "Source", "Inbr"]
+COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Rel%", "Gen", "Source", "Inbr"]
 COL_NAME  = 0
 COL_GEN   = 1
 COL_ROOM  = 2
@@ -947,14 +993,19 @@ STAT_COLS = list(range(4, 11))   # STR … LCK  (indices 4–10)
 COL_SUM   = 11
 COL_ABIL  = 12
 COL_MUTS  = 13
-COL_AGE   = 14   # generation depth
-COL_SRC   = 15
-COL_INB   = 16
+COL_REL   = 14
+COL_AGE   = 15   # generation depth
+COL_SRC   = 16
+COL_INB   = 17
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
 _W_STAT   = 34
 _W_GEN    = 28
+_W_REL    = 68
+_ZOOM_MIN = 70
+_ZOOM_MAX = 200
+_ZOOM_STEP = 10
 
 
 class CatTableModel(QAbstractTableModel):
@@ -963,6 +1014,7 @@ class CatTableModel(QAbstractTableModel):
         self._cats: list[Cat] = []
         self._focus_cat: Optional[Cat] = None
         self._show_lineage: bool = False
+        self._relation_cache: dict[int, float] = {}
 
     def set_show_lineage(self, show: bool):
         self._show_lineage = show
@@ -976,16 +1028,31 @@ class CatTableModel(QAbstractTableModel):
     def load(self, cats: list[Cat]):
         self.beginResetModel()
         self._cats = cats
+        self._relation_cache.clear()
         self.endResetModel()
 
     def set_focus_cat(self, cat: Optional[Cat]):
         self._focus_cat = cat
+        self._relation_cache.clear()
         if self._cats:
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._cats) - 1, len(COLUMNS) - 1),
-                [Qt.BackgroundRole, Qt.ForegroundRole],
+                [Qt.DisplayRole, Qt.UserRole, Qt.BackgroundRole, Qt.ForegroundRole],
             )
+
+    def _relation_for(self, cat: Cat) -> float:
+        if self._focus_cat is None:
+            return 0.0
+        if cat is self._focus_cat:
+            return 100.0
+        key = id(cat)
+        cached = self._relation_cache.get(key)
+        if cached is not None:
+            return cached
+        pct = relation_percent(self._focus_cat, cat)
+        self._relation_cache[key] = pct
+        return pct
 
     def rowCount(self, parent=QModelIndex()):    return len(self._cats)
     def columnCount(self, parent=QModelIndex()): return len(COLUMNS)
@@ -1014,6 +1081,14 @@ class CatTableModel(QAbstractTableModel):
                 return ", ".join(cat.mutations)
             if col == COL_ABIL:
                 return ", ".join(cat.abilities)
+            if col == COL_REL:
+                if self._focus_cat is None:
+                    return "—"
+                rel = self._relation_for(cat)
+                rounded = round(rel)
+                if abs(rel - rounded) < 1e-9:
+                    return f"{int(rounded)}%"
+                return f"{rel:.2f}%"
             if col == COL_AGE:
                 return str(cat.generation)
             if col == COL_SRC:
@@ -1034,6 +1109,8 @@ class CatTableModel(QAbstractTableModel):
                 return cat.base_stats[STAT_NAMES[col - 4]]
             if col == COL_SUM:
                 return sum(cat.base_stats.values())
+            if col == COL_REL:
+                return self._relation_for(cat) if self._focus_cat is not None else -1.0
             if col == COL_AGE:
                 return cat.generation
             return self.data(index, Qt.DisplayRole)
@@ -1104,7 +1181,7 @@ class CatTableModel(QAbstractTableModel):
                 return "\n".join(cat.abilities)
 
         elif role == Qt.TextAlignmentRole:
-            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_SUM, COL_AGE):
+            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_SUM, COL_REL, COL_AGE):
                 return Qt.AlignCenter
 
         return None
@@ -1713,9 +1790,27 @@ class MainWindow(QMainWindow):
         self._room_btns: dict = {}
         self._active_btn = None
         self._show_lineage: bool = False
+        self._zoom_percent: int = 100
+        self._base_font: QFont = QApplication.instance().font()
+        self._base_sidebar_width = 190
+        self._base_header_height = 46
+        self._base_search_width = 180
+        self._base_col_widths = {
+            COL_NAME: 130,
+            COL_GEN: _W_GEN,
+            COL_STAT: _W_STATUS,
+            COL_SUM: 38,
+            COL_ABIL: 180,
+            COL_MUTS: 155,
+            COL_REL: _W_REL,
+            COL_AGE: 34,
+            COL_INB: 38,
+            **{c: _W_STAT for c in STAT_COLS},
+        }
 
         self._build_ui()
         self._build_menu()
+        self._apply_zoom()
 
         self._watcher = QFileSystemWatcher(self)
         self._watcher.fileChanged.connect(self._on_file_changed)
@@ -1752,6 +1847,38 @@ class MainWindow(QMainWindow):
         self._lineage_action.triggered.connect(self._toggle_lineage)
         sm.addAction(self._lineage_action)
 
+        sm.addSeparator()
+        zoom_in = QAction("Zoom In", self)
+        zoom_in_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomIn)
+        if not zoom_in_keys:
+            zoom_in_keys = []
+        for seq in (QKeySequence("Ctrl+="), QKeySequence("Ctrl++")):
+            if seq not in zoom_in_keys:
+                zoom_in_keys.append(seq)
+        zoom_in.setShortcuts(zoom_in_keys)
+        zoom_in.triggered.connect(lambda: self._change_zoom(+1))
+        sm.addAction(zoom_in)
+
+        zoom_out = QAction("Zoom Out", self)
+        zoom_out_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomOut)
+        if not zoom_out_keys:
+            zoom_out_keys = []
+        if QKeySequence("Ctrl+-") not in zoom_out_keys:
+            zoom_out_keys.append(QKeySequence("Ctrl+-"))
+        zoom_out.setShortcuts(zoom_out_keys)
+        zoom_out.triggered.connect(lambda: self._change_zoom(-1))
+        sm.addAction(zoom_out)
+
+        zoom_reset = QAction("Reset Zoom", self)
+        zoom_reset.setShortcut("Ctrl+0")
+        zoom_reset.triggered.connect(self._reset_zoom)
+        sm.addAction(zoom_reset)
+
+        self._zoom_info_action = QAction("", self)
+        self._zoom_info_action.setEnabled(False)
+        sm.addAction(self._zoom_info_action)
+        self._update_zoom_info_action()
+
     # ── Layout ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -1773,7 +1900,8 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         w  = QWidget()
-        w.setFixedWidth(190)
+        self._sidebar = w
+        w.setFixedWidth(self._base_sidebar_width)
         w.setStyleSheet("background:#14142a;")
         vb = QVBoxLayout(w)
         vb.setContentsMargins(8, 14, 8, 12)
@@ -1866,8 +1994,9 @@ class MainWindow(QMainWindow):
 
         # Header
         hdr = QWidget()
+        self._header = hdr
         hdr.setStyleSheet("background:#16213e; border-bottom:1px solid #1e1e38;")
-        hdr.setFixedHeight(46)
+        hdr.setFixedHeight(self._base_header_height)
         hb = QHBoxLayout(hdr); hb.setContentsMargins(14, 0, 14, 0)
         self._header_lbl = QLabel("All Cats")
         self._header_lbl.setStyleSheet("color:#eee; font-size:15px; font-weight:bold;")
@@ -1878,7 +2007,7 @@ class MainWindow(QMainWindow):
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search…")
         self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(180)
+        self._search.setFixedWidth(self._base_search_width)
         self._search.setStyleSheet(
             "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
             " border-radius:4px; padding:3px 8px; font-size:12px; }"
@@ -1922,7 +2051,7 @@ class MainWindow(QMainWindow):
         # Name: interactive so the user can resize it; not Stretch so it
         # doesn't eat the blank space that should sit at the right edge.
         hh.setSectionResizeMode(COL_NAME, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_NAME, 130)
+        self._table.setColumnWidth(COL_NAME, self._base_col_widths[COL_NAME])
 
         # Room: size to content so it adapts to room name length
         hh.setSectionResizeMode(COL_ROOM, QHeaderView.ResizeToContents)
@@ -1935,15 +2064,19 @@ class MainWindow(QMainWindow):
 
         # Abilities: interactive — user drags to taste
         hh.setSectionResizeMode(COL_ABIL, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_ABIL, 180)
+        self._table.setColumnWidth(COL_ABIL, self._base_col_widths[COL_ABIL])
 
         # Mutations: interactive
         hh.setSectionResizeMode(COL_MUTS, QHeaderView.Interactive)
-        self._table.setColumnWidth(COL_MUTS, 155)
+        self._table.setColumnWidth(COL_MUTS, self._base_col_widths[COL_MUTS])
+
+        # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
+        hh.setSectionResizeMode(COL_REL, QHeaderView.Fixed)
+        self._table.setColumnWidth(COL_REL, self._base_col_widths[COL_REL])
 
         # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_AGE, QHeaderView.Fixed)
-        self._table.setColumnWidth(COL_AGE, 34)
+        self._table.setColumnWidth(COL_AGE, self._base_col_widths[COL_AGE])
         self._table.setColumnHidden(COL_AGE, True)
 
         # Source: Stretch — absorbs blank space, hidden by default (behind lineage toggle)
@@ -1952,7 +2085,7 @@ class MainWindow(QMainWindow):
 
         # Inbreeding score: fixed narrow, hidden by default
         hh.setSectionResizeMode(COL_INB, QHeaderView.Fixed)
-        self._table.setColumnWidth(COL_INB, 38)
+        self._table.setColumnWidth(COL_INB, self._base_col_widths[COL_INB])
         self._table.setColumnHidden(COL_INB, True)
 
         self._table.setStyleSheet("""
@@ -2102,6 +2235,51 @@ class MainWindow(QMainWindow):
     def _on_file_changed(self, path: str):
         if path == self._current_save:
             self._reload()
+
+    # ── UI zoom ───────────────────────────────────────────────────────────
+
+    def _scaled(self, value: int) -> int:
+        return max(1, round(value * (self._zoom_percent / 100.0)))
+
+    def _update_zoom_info_action(self):
+        if hasattr(self, "_zoom_info_action"):
+            self._zoom_info_action.setText(f"Zoom: {self._zoom_percent}%")
+
+    def _set_zoom(self, percent: int):
+        clamped = max(_ZOOM_MIN, min(_ZOOM_MAX, int(percent)))
+        if clamped == self._zoom_percent:
+            return
+        self._zoom_percent = clamped
+        self._apply_zoom()
+        self._update_zoom_info_action()
+        self.statusBar().showMessage(f"UI zoom set to {self._zoom_percent}%")
+
+    def _change_zoom(self, direction: int):
+        self._set_zoom(self._zoom_percent + (direction * _ZOOM_STEP))
+
+    def _reset_zoom(self):
+        self._set_zoom(100)
+
+    def _apply_zoom(self):
+        app = QApplication.instance()
+        font = QFont(self._base_font)
+        base_pt = self._base_font.pointSizeF()
+        if base_pt > 0:
+            font.setPointSizeF(max(7.0, base_pt * (self._zoom_percent / 100.0)))
+        elif self._base_font.pixelSize() > 0:
+            font.setPixelSize(max(9, self._scaled(self._base_font.pixelSize())))
+        app.setFont(font)
+
+        if hasattr(self, "_sidebar"):
+            self._sidebar.setFixedWidth(self._scaled(self._base_sidebar_width))
+        if hasattr(self, "_header"):
+            self._header.setFixedHeight(self._scaled(self._base_header_height))
+        if hasattr(self, "_search"):
+            self._search.setFixedWidth(self._scaled(self._base_search_width))
+        if hasattr(self, "_table"):
+            for col, width in self._base_col_widths.items():
+                self._table.setColumnWidth(col, self._scaled(width))
+            self._table.verticalHeader().setDefaultSectionSize(self._scaled(24))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
