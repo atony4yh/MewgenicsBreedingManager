@@ -22,13 +22,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableView, QPushButton, QLabel, QFileDialog, QHeaderView,
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
-    QLineEdit,
+    QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
+    QTableWidget, QTableWidgetItem, QStyledItemDelegate,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
-    QFileSystemWatcher, QItemSelectionModel,
+    QFileSystemWatcher, QItemSelectionModel, QSize,
 )
-from PySide6.QtGui import QColor, QBrush, QAction, QPalette, QFont, QKeySequence
+from PySide6.QtGui import QColor, QBrush, QAction, QPalette, QFont, QKeySequence, QFontMetrics
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -741,31 +742,86 @@ def _ancestor_depths(cat: Optional[Cat], max_depth: int = 8) -> dict[Cat, int]:
     return depths
 
 
-def relation_percent(a: Optional[Cat], b: Optional[Cat], max_depth: int = 8) -> float:
+def _ancestor_paths(start: Optional['Cat'], max_steps: int = 12) -> dict['Cat', list[tuple['Cat', ...]]]:
     """
-    Approximate relatedness (0-100) from shared lineage.
-    Uses a relationship-coefficient style sum:
-      contribution = 0.5 ** (depth_from_a + depth_from_b)
-    across all shared ancestors (including each cat itself at depth 0).
+    For each reachable ancestor, return all unique upward paths from `start`
+    to that ancestor (inclusive). Paths never repeat the same cat.
+    """
+    if start is None:
+        return {}
+    paths: dict[Cat, list[tuple[Cat, ...]]] = {}
+    stack: list[tuple[Cat, tuple[Cat, ...], frozenset[int]]] = [(start, (start,), frozenset({id(start)}))]
+    while stack:
+        node, path, seen = stack.pop()
+        paths.setdefault(node, []).append(path)
+        steps = len(path) - 1
+        if steps >= max_steps:
+            continue
+        for parent in (node.parent_a, node.parent_b):
+            if parent is None:
+                continue
+            pid = id(parent)
+            if pid in seen:
+                continue
+            stack.append((parent, path + (parent,), seen | frozenset({pid})))
+    return paths
+
+
+def raw_coi(a: Optional['Cat'], b: Optional['Cat'], max_steps: int = 12) -> float:
+    """
+    Raw Coefficient of Inbreeding between two cats:
+      sum(0.5 ** (n + 1)) over all valid paths through common ancestors,
+    where n = total edge count from A up to ancestor and down to B.
     """
     if a is None or b is None:
         return 0.0
-    if a is b:
-        return 100.0
-    da = _ancestor_depths(a, max_depth=max_depth)
-    db = _ancestor_depths(b, max_depth=max_depth)
-    common = set(da.keys()) & set(db.keys())
+    pa = _ancestor_paths(a, max_steps=max_steps)
+    pb = _ancestor_paths(b, max_steps=max_steps)
+    common = set(pa.keys()) & set(pb.keys())
     if not common:
         return 0.0
-    coef = 0.0
+    coi = 0.0
     for anc in common:
-        coef += 0.5 ** (da[anc] + db[anc])
-    return max(0.0, min(100.0, coef * 100.0))
+        for path_a in pa[anc]:
+            set_a = {id(x) for x in path_a}
+            sa = len(path_a) - 1
+            for path_b in pb[anc]:
+                # Valid full path cannot pass through the same cat twice
+                # (except the common ancestor itself).
+                overlap = (set_a & {id(x) for x in path_b}) - {id(anc)}
+                if overlap:
+                    continue
+                sb = len(path_b) - 1
+                coi += 0.5 ** (sa + sb + 1)
+    return coi
+
+
+def risk_percent(a: Optional['Cat'], b: Optional['Cat']) -> float:
+    """
+    Normalize raw CoI to UI risk scale:
+      0.25 CoI => 100% risk, clamped to [0, 100].
+    """
+    return max(0.0, min(100.0, (raw_coi(a, b) / 0.25) * 100.0))
 
 
 def find_common_ancestors(a: Cat, b: Cat) -> list[Cat]:
     """Return cats that appear in both ancestry trees."""
     return list(get_all_ancestors(a) & get_all_ancestors(b))
+
+
+def shared_ancestor_counts(a: Cat, b: Cat, recent_depth: int = 3, max_depth: int = 8) -> tuple[int, int]:
+    """
+    Return (total_shared, recent_shared) common ancestor counts.
+    recent_shared counts ancestors where both cats are within `recent_depth`
+    generations of that ancestor (used for inbreeding-risk checks).
+    """
+    da = _ancestor_depths(a, max_depth=max_depth)
+    db = _ancestor_depths(b, max_depth=max_depth)
+    common = set(da.keys()) & set(db.keys())
+    if not common:
+        return 0, 0
+    recent_shared = sum(1 for anc in common if da[anc] <= recent_depth and db[anc] <= recent_depth)
+    return len(common), recent_shared
 
 
 def get_parents(cat: Cat) -> list[Cat]:
@@ -984,7 +1040,7 @@ def find_save_files() -> list[str]:
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Rel%", "Gen", "Source", "Inbr"]
+COLUMNS   = ["Name", "♀/♂", "Room", "Status"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Risk%", "Gen", "Source", "Inbr"]
 COL_NAME  = 0
 COL_GEN   = 1
 COL_ROOM  = 2
@@ -1050,7 +1106,7 @@ class CatTableModel(QAbstractTableModel):
         cached = self._relation_cache.get(key)
         if cached is not None:
             return cached
-        pct = relation_percent(self._focus_cat, cat)
+        pct = risk_percent(self._focus_cat, cat)
         self._relation_cache[key] = pct
         return pct
 
@@ -1084,11 +1140,7 @@ class CatTableModel(QAbstractTableModel):
             if col == COL_REL:
                 if self._focus_cat is None:
                     return "—"
-                rel = self._relation_for(cat)
-                rounded = round(rel)
-                if abs(rel - rounded) < 1e-9:
-                    return f"{int(rounded)}%"
-                return f"{rel:.2f}%"
+                return f"{int(round(self._relation_for(cat)))}%"
             if col == COL_AGE:
                 return str(cat.generation)
             if col == COL_SRC:
@@ -1759,6 +1811,503 @@ class LineageDialog(QDialog):
         outer.addWidget(close_btn, alignment=Qt.AlignRight)
 
 
+class FamilyTreeBrowserView(QWidget):
+    """
+    Dedicated tree-browsing view:
+    left side = cat list, right side = visual family tree for selected cat.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QListWidget { background:#0d0d1c; color:#ddd; border:1px solid #1e1e38; }"
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QScrollArea { border:none; background:#0a0a18; }"
+        )
+        self._cats: list[Cat] = []
+        self._by_key: dict[int, Cat] = {}
+        self._alive_only: bool = True
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # Left pane: search + list
+        left = QWidget()
+        left.setFixedWidth(320)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        lv.addWidget(QLabel("Cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(6)
+        self._all_btn = _sidebar_btn("All")
+        self._alive_btn = _sidebar_btn("Alive")
+        self._all_btn.setCheckable(True)
+        self._alive_btn.setCheckable(True)
+        self._alive_btn.setChecked(True)
+        self._all_btn.clicked.connect(lambda: self._set_alive_only(False))
+        self._alive_btn.clicked.connect(lambda: self._set_alive_only(True))
+        mode_row.addWidget(self._all_btn)
+        mode_row.addWidget(self._alive_btn)
+        lv.addLayout(mode_row)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search cat name…")
+        lv.addWidget(self._search)
+        self._list = QListWidget()
+        lv.addWidget(self._list, 1)
+        root.addWidget(left)
+
+        # Right pane: tree
+        self._tree_scroll = QScrollArea()
+        self._tree_scroll.setWidgetResizable(True)
+        self._tree_content = QWidget()
+        self._tree_scroll.setWidget(self._tree_content)
+        root.addWidget(self._tree_scroll, 1)
+
+        self._search.textChanged.connect(self._refresh_list)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
+
+    def set_cats(self, cats: list[Cat]):
+        selected_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            selected_key = int(cur.data(Qt.UserRole))
+        self._cats = sorted(cats, key=lambda c: (c.name or "").lower())
+        self._by_key = {c.db_key: c for c in self._cats}
+        self._refresh_list()
+        if selected_key is not None and selected_key in self._by_key:
+            self.select_cat(self._by_key[selected_key])
+        elif self._list.count():
+            self._list.setCurrentRow(0)
+        else:
+            self._render_tree(None)
+
+    def select_cat(self, cat: Optional[Cat]):
+        if cat is None:
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if int(item.data(Qt.UserRole)) == cat.db_key:
+                self._list.setCurrentRow(i)
+                self._list.scrollToItem(item)
+                return
+
+    def _open_cat_from_tree(self, cat: Optional[Cat]):
+        if cat is None:
+            return
+        # If a gone cat is clicked while Alive filter is active, switch to All.
+        if self._alive_only and cat.status == "Gone":
+            self._set_alive_only(False)
+        # Ensure search does not hide the clicked target.
+        if self._search.text():
+            self._search.clear()
+        self.select_cat(cat)
+
+    def _set_alive_only(self, enabled: bool):
+        self._alive_only = enabled
+        self._alive_btn.setChecked(enabled)
+        self._all_btn.setChecked(not enabled)
+        self._refresh_list()
+
+    def _refresh_list(self):
+        query = self._search.text().strip().lower()
+        current_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            current_key = int(cur.data(Qt.UserRole))
+
+        self._list.clear()
+        for cat in self._cats:
+            if self._alive_only and cat.status == "Gone":
+                continue
+            if query and query not in cat.name.lower():
+                continue
+            label = f"{cat.name}  ({cat.gender_display})"
+            if cat.status != "In House":
+                label += f"  [{STATUS_ABBREV.get(cat.status, cat.status)}]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, cat.db_key)
+            self._list.addItem(item)
+
+        if self._list.count() == 0:
+            self._render_tree(None)
+            return
+        if current_key is not None:
+            for i in range(self._list.count()):
+                it = self._list.item(i)
+                if int(it.data(Qt.UserRole)) == current_key:
+                    self._list.setCurrentRow(i)
+                    return
+        self._list.setCurrentRow(0)
+
+    def _on_current_item_changed(self, current, previous):
+        if current is None:
+            self._render_tree(None)
+            return
+        cat = self._by_key.get(int(current.data(Qt.UserRole)))
+        self._render_tree(cat)
+
+    def _render_tree(self, cat: Optional[Cat]):
+        self._tree_content = QWidget()
+        self._tree_scroll.setWidget(self._tree_content)
+
+        root = QVBoxLayout(self._tree_content)
+        root.setContentsMargins(8, 6, 8, 8)
+        root.setSpacing(10)
+
+        if cat is None:
+            root.addWidget(QLabel("No cats match the current filter.", styleSheet="color:#666; font-size:12px;"))
+            root.addStretch()
+            return
+
+        title = QLabel(f"Family Tree — {cat.name}")
+        title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
+        root.addWidget(title)
+        root.addWidget(QLabel("Click any box to jump to that cat.", styleSheet="color:#666; font-size:11px;"))
+
+        def cat_box(c: Optional[Cat], highlight=False):
+            if c is None:
+                btn = QPushButton("Unknown")
+                btn.setEnabled(False)
+                btn.setStyleSheet(
+                    "QPushButton { color:#303040; font-size:10px; padding:7px 10px;"
+                    " background:#0e0e1c; border:1px solid #18182a; border-radius:6px; }")
+                return btn
+            line2 = c.gender_display
+            if c.room_display:
+                line2 += f"  {c.room_display}"
+            if c.status == "Gone":
+                line2 += "  (Gone)"
+            bg = "#1d2f4a" if highlight else "#131326"
+            border = "#3b5f95" if highlight else "#252545"
+            btn = QPushButton(f"{c.name}\n{line2}")
+            btn.setStyleSheet(
+                f"QPushButton {{ color:#ddd; font-size:10px; padding:7px 10px;"
+                f" background:{bg}; border:1px solid {border}; border-radius:6px; }}"
+                "QPushButton:hover { background:#1a2a46; }")
+            if c is not cat:
+                btn.clicked.connect(lambda checked=False, target=c: self._open_cat_from_tree(target))
+            else:
+                btn.setEnabled(False)
+            btn.setMinimumWidth(120)
+            return btn
+
+        def row_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#444; font-weight:bold; letter-spacing:1px;")
+            lbl.setFixedWidth(row_label_width)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return lbl
+
+        def add_generation_row(label: str, cats_row: list[Optional[Cat]], highlight_self=False):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(row_label(label))
+            for c in cats_row:
+                row.addWidget(cat_box(c, highlight=highlight_self and c is cat))
+            row.addStretch()
+            root.addLayout(row)
+
+        def add_arrow():
+            a = QLabel("↓")
+            a.setStyleSheet("color:#2f3f66; font-size:16px;")
+            a.setAlignment(Qt.AlignCenter)
+            root.addWidget(a)
+
+        def _dedupe_keep_order(items: list[Cat]) -> list[Cat]:
+            seen = set()
+            out: list[Cat] = []
+            for item in items:
+                sid = id(item)
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                out.append(item)
+            return out
+
+        def _ancestor_row_label(level: int) -> str:
+            if level == 1:
+                return "PARENTS"
+            if level == 2:
+                return "GRANDPARENTS"
+            if level == 3:
+                return "GREAT-GRANDPARENTS"
+            return f"{level - 2}x GREAT-GRANDPARENTS"
+
+        # Build all known ancestor levels (1=parents, 2=grandparents, ...).
+        ancestor_levels: list[list[Cat]] = []
+        frontier: list[Cat] = [cat]
+        for _ in range(8):
+            nxt: list[Cat] = []
+            for node in frontier:
+                if node.parent_a is not None:
+                    nxt.append(node.parent_a)
+                if node.parent_b is not None:
+                    nxt.append(node.parent_b)
+            nxt = _dedupe_keep_order(nxt)
+            if not nxt:
+                break
+            ancestor_levels.append(nxt)
+            frontier = nxt
+
+        # Dynamic row-label gutter width: based on the longest visible label and
+        # current font metrics, so it tracks zoom/font-size changes.
+        label_texts = ["SELF", "CHILDREN", "GRANDCHILDREN"] + [
+            _ancestor_row_label(i) for i in range(1, len(ancestor_levels) + 1)
+        ]
+        label_font = QFont(self.font())
+        label_font.setBold(True)
+        fm = QFontMetrics(label_font)
+        max_text_px = max(fm.horizontalAdvance(t) for t in label_texts)
+        # Row labels use letter-spacing:1px in stylesheet; account for that so
+        # long prefixes like "10x " are fully measured.
+        max_letter_spacing_px = max(max(len(t) - 1, 0) for t in label_texts)
+        row_label_width = max(120, max_text_px + max_letter_spacing_px + 24)
+
+        children = list(cat.children)
+        grandchildren: list[Cat] = []
+        for child in children:
+            grandchildren.extend(child.children)
+        grandchildren = list({id(c): c for c in grandchildren}.values())
+
+        # Render oldest ancestors at top, then down to self.
+        for idx in range(len(ancestor_levels), 0, -1):
+            level_nodes = ancestor_levels[idx - 1]
+            add_generation_row(_ancestor_row_label(idx), level_nodes[:12])
+            if len(level_nodes) > 12:
+                root.addWidget(QLabel(
+                    f"… and {len(level_nodes)-12} more in {_ancestor_row_label(idx)}",
+                    styleSheet="color:#555; font-size:10px;"))
+            add_arrow()
+        add_generation_row("SELF", [cat], highlight_self=True)
+
+        if children:
+            add_arrow()
+            add_generation_row("CHILDREN", children[:10])
+            if len(children) > 10:
+                root.addWidget(QLabel(f"… and {len(children)-10} more children", styleSheet="color:#555; font-size:10px;"))
+        if grandchildren:
+            add_arrow()
+            add_generation_row("GRANDCHILDREN", grandchildren[:10])
+            if len(grandchildren) > 10:
+                root.addWidget(QLabel(f"… and {len(grandchildren)-10} more grandchildren", styleSheet="color:#555; font-size:10px;"))
+        if not any([ancestor_levels, children, grandchildren]):
+            root.addWidget(QLabel("No known lineage data for this cat yet.", styleSheet="color:#666; font-size:12px;"))
+
+        root.addStretch()
+
+
+class SafeBreedingView(QWidget):
+    """Dedicated view for ranking alive breeding candidates."""
+    class _ColumnPaddingDelegate(QStyledItemDelegate):
+        def __init__(self, extra_width: int, parent=None):
+            super().__init__(parent)
+            self._extra_width = extra_width
+
+        def sizeHint(self, option, index):
+            s = super().sizeHint(option, index)
+            return QSize(s.width() + self._extra_width, s.height())
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QListWidget { background:#0d0d1c; color:#ddd; border:1px solid #1e1e38; }"
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+        )
+        self._cats: list[Cat] = []
+        self._alive: list[Cat] = []
+        self._by_key: dict[int, Cat] = {}
+        self._table_row_cat_keys: list[int] = []
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        left = QWidget()
+        left.setFixedWidth(320)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(8)
+        lv.addWidget(QLabel("Alive cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search cat name…")
+        lv.addWidget(self._search)
+        self._list = QListWidget()
+        lv.addWidget(self._list, 1)
+        root.addWidget(left)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(8)
+        self._title = QLabel("Safe Breeding")
+        self._title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#666; font-size:11px;")
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Cat", "Risk%", "Shared Anc.", "Children will be"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setSortingEnabled(False)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._table.setColumnWidth(1, 80)
+        self._table.setColumnWidth(2, 110)
+        self._table.setItemDelegateForColumn(3, SafeBreedingView._ColumnPaddingDelegate(24, self._table))
+
+        rv.addWidget(self._title)
+        rv.addWidget(self._summary)
+        rv.addWidget(self._table, 1)
+        root.addWidget(right, 1)
+
+        self._search.textChanged.connect(self._refresh_list)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
+        self._table.cellClicked.connect(self._on_table_row_clicked)
+
+    def set_cats(self, cats: list[Cat]):
+        selected_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            selected_key = int(cur.data(Qt.UserRole))
+        self._cats = cats
+        self._alive = sorted([c for c in cats if c.status != "Gone"], key=lambda c: (c.name or "").lower())
+        self._by_key = {c.db_key: c for c in self._alive}
+        self._refresh_list()
+        if selected_key is not None and selected_key in self._by_key:
+            self.select_cat(self._by_key[selected_key])
+        elif self._list.count():
+            self._list.setCurrentRow(0)
+        else:
+            self._render_for(None)
+
+    def select_cat(self, cat: Optional[Cat]):
+        if cat is None or cat.db_key not in self._by_key:
+            return
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if int(item.data(Qt.UserRole)) == cat.db_key:
+                self._list.setCurrentRow(i)
+                self._list.scrollToItem(item)
+                return
+
+    def _refresh_list(self):
+        query = self._search.text().strip().lower()
+        current_key = None
+        cur = self._list.currentItem()
+        if cur is not None:
+            current_key = int(cur.data(Qt.UserRole))
+
+        self._list.clear()
+        for cat in self._alive:
+            if query and query not in cat.name.lower():
+                continue
+            item = QListWidgetItem(f"{cat.name}  ({cat.gender_display})")
+            item.setData(Qt.UserRole, cat.db_key)
+            self._list.addItem(item)
+        if self._list.count() == 0:
+            self._render_for(None)
+            return
+        if current_key is not None:
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if int(item.data(Qt.UserRole)) == current_key:
+                    self._list.setCurrentRow(i)
+                    return
+        self._list.setCurrentRow(0)
+
+    def _on_current_item_changed(self, current, previous):
+        if current is None:
+            self._render_for(None)
+            return
+        self._render_for(self._by_key.get(int(current.data(Qt.UserRole))))
+
+    def _on_table_row_clicked(self, row: int, _column: int):
+        if row < 0 or row >= len(self._table_row_cat_keys):
+            return
+        cat = self._by_key.get(self._table_row_cat_keys[row])
+        if cat is not None:
+            self.select_cat(cat)
+
+    def _render_for(self, cat: Optional[Cat]):
+        self._table.setRowCount(0)
+        self._table_row_cat_keys = []
+        if cat is None:
+            self._title.setText("Safe Breeding")
+            self._summary.setText("Select an alive cat.")
+            return
+
+        self._title.setText(f"Safe Breeding — {cat.name}")
+        candidates: list[tuple[float, int, int, Cat]] = []
+        for other in self._alive:
+            if other is cat:
+                continue
+            ok, _ = can_breed(cat, other)
+            if not ok:
+                continue
+            shared, recent_shared = shared_ancestor_counts(cat, other, recent_depth=3)
+            rel = risk_percent(cat, other)
+            closest_recent_gen = 0
+            if recent_shared:
+                da = _ancestor_depths(cat, max_depth=8)
+                db = _ancestor_depths(other, max_depth=8)
+                common = set(da.keys()) & set(db.keys())
+                recent_levels = [
+                    max(da[anc], db[anc])
+                    for anc in common
+                    if da[anc] <= 3 and db[anc] <= 3
+                ]
+                closest_recent_gen = min(recent_levels) if recent_levels else 3
+            # Sort by Risk% first so safest pairs appear at top.
+            candidates.append((rel, recent_shared * 1000 + shared, closest_recent_gen, other))
+        candidates.sort(key=lambda t: (t[0], t[1], (t[3].name or "").lower()))
+
+        self._summary.setText(
+            f"{len(candidates)} possible alive candidates  |  "
+            "Risk% = normalized CoI (0.25 => 100%)"
+        )
+        self._table.setRowCount(len(candidates))
+        for row, (rel, packed_shared, closest_recent_gen, other) in enumerate(candidates):
+            self._table_row_cat_keys.append(other.db_key)
+            shared = packed_shared % 1000
+            risk_pct = int(round(rel))
+            if risk_pct >= 100:
+                tag, col = "Highly Inbred", QColor(217, 119, 119)
+            elif risk_pct >= 50:
+                tag, col = "Moderately Inbred", QColor(216, 181, 106)
+            elif risk_pct >= 20:
+                tag, col = "Slightly Inbred", QColor(143, 201, 230)
+            else:
+                tag, col = "Not Inbred", QColor(98, 194, 135)
+
+            name_item = QTableWidgetItem(f"{other.name} ({other.gender_display})")
+            rel_item = QTableWidgetItem(f"{risk_pct}%")
+            shared_item = QTableWidgetItem(str(shared))
+            risk_item = QTableWidgetItem(tag)
+            rel_item.setData(Qt.UserRole, risk_pct)
+            shared_item.setData(Qt.UserRole, shared)
+            for it in (rel_item, shared_item, risk_item):
+                it.setTextAlignment(Qt.AlignCenter)
+            risk_item.setForeground(QBrush(col))
+            self._table.setItem(row, 0, name_item)
+            self._table.setItem(row, 1, rel_item)
+            self._table.setItem(row, 2, shared_item)
+            self._table.setItem(row, 3, risk_item)
+
+
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
 
 _SIDEBAR_BTN = """
@@ -1790,6 +2339,8 @@ class MainWindow(QMainWindow):
         self._room_btns: dict = {}
         self._active_btn = None
         self._show_lineage: bool = False
+        self._tree_view: Optional[FamilyTreeBrowserView] = None
+        self._safe_breeding_view: Optional[SafeBreedingView] = None
         self._zoom_percent: int = 100
         self._base_font: QFont = QApplication.instance().font()
         self._base_sidebar_width = 190
@@ -1927,6 +2478,13 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_all)
         self._room_btns[None] = self._btn_all
 
+        self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
+        self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
+        vb.addWidget(self._btn_safe_breeding_view)
+        self._btn_tree_view = _sidebar_btn("Family Tree View")
+        self._btn_tree_view.clicked.connect(self._open_tree_browser)
+        vb.addWidget(self._btn_tree_view)
+
         vb.addWidget(_hsep())
         vb.addWidget(sl("ROOMS"))
         self._rooms_vb = QVBoxLayout(); self._rooms_vb.setSpacing(2)
@@ -2025,6 +2583,7 @@ class MainWindow(QMainWindow):
         vs.setHandleWidth(4)
         vs.setStyleSheet("QSplitter::handle:vertical { background:#1e1e38; }")
         self._detail_splitter = vs
+        self._table_view_container = vs
         vb.addWidget(vs)
 
         # Table
@@ -2119,6 +2678,15 @@ class MainWindow(QMainWindow):
         vs.setStretchFactor(0, 1)
         vs.setStretchFactor(1, 0)
 
+        # Family tree view lives in the same main container and is swapped in/out
+        # via left sidebar "VIEW" buttons.
+        self._tree_view = FamilyTreeBrowserView(self)
+        self._tree_view.hide()
+        vb.addWidget(self._tree_view, 1)
+        self._safe_breeding_view = SafeBreedingView(self)
+        self._safe_breeding_view.hide()
+        vb.addWidget(self._safe_breeding_view, 1)
+
         return w
 
     # ── Selection → detail ────────────────────────────────────────────────
@@ -2139,10 +2707,15 @@ class MainWindow(QMainWindow):
         # Highlight compatibility: dim incompatible cats when 1 is selected
         focus = cats[0] if len(cats) == 1 else None
         self._source_model.set_focus_cat(focus)
+        if self._tree_view is not None and self._tree_view.isVisible() and focus is not None:
+            self._tree_view.select_cat(focus)
+        if self._safe_breeding_view is not None and self._safe_breeding_view.isVisible() and focus is not None:
+            self._safe_breeding_view.select_cat(focus)
 
     # ── Filtering ──────────────────────────────────────────────────────────
 
     def _filter(self, room_key, btn: QPushButton):
+        self._show_table_view()
         if self._active_btn and self._active_btn is not btn:
             self._active_btn.setChecked(False)
         btn.setChecked(True)
@@ -2152,6 +2725,56 @@ class MainWindow(QMainWindow):
         self._update_count()
         self._detail.show_cats([])
         self._source_model.set_focus_cat(None)
+
+    def _show_table_view(self):
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if hasattr(self, "_header"):
+            self._header.show()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+
+    def _show_tree_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if self._tree_view is not None:
+            self._tree_view.set_cats(self._cats)
+            self._tree_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(True)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+
+    def _show_safe_breeding_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if self._safe_breeding_view is not None:
+            self._safe_breeding_view.set_cats(self._cats)
+            self._safe_breeding_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(True)
 
     def _update_header(self, room_key):
         if room_key == "__all__":
@@ -2199,6 +2822,10 @@ class MainWindow(QMainWindow):
             self._btn_adventure.setText(f"On Adventure  ({adv})")
             self._btn_gone.setText(f"Gone  ({gone})")
             self._filter(None, self._btn_all)
+            if self._tree_view is not None:
+                self._tree_view.set_cats(cats)
+            if self._safe_breeding_view is not None:
+                self._safe_breeding_view.set_cats(cats)
 
             name = os.path.basename(path)
             self._save_lbl.setText(name)
@@ -2235,6 +2862,26 @@ class MainWindow(QMainWindow):
     def _on_file_changed(self, path: str):
         if path == self._current_save:
             self._reload()
+
+    def _open_tree_browser(self):
+        self._show_tree_view()
+        rows = list({
+            self._proxy_model.mapToSource(idx).row()
+            for idx in self._table.selectionModel().selectedRows()
+        })
+        cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
+        if cats and self._tree_view is not None:
+            self._tree_view.select_cat(cats[0])
+
+    def _open_safe_breeding_view(self):
+        self._show_safe_breeding_view()
+        rows = list({
+            self._proxy_model.mapToSource(idx).row()
+            for idx in self._table.selectionModel().selectedRows()
+        })
+        cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
+        if cats and self._safe_breeding_view is not None:
+            self._safe_breeding_view.select_cat(cats[0])
 
     # ── UI zoom ───────────────────────────────────────────────────────────
 
