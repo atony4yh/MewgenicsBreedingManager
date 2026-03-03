@@ -2384,6 +2384,433 @@ class SafeBreedingView(QWidget):
             self._table.setItem(row, 3, risk_item)
 
 
+# ── Room Optimizer View ───────────────────────────────────────────────────────
+
+class RoomOptimizerView(QWidget):
+    """View for optimizing cat room distribution to maximize breeding outcomes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._cats: list[Cat] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # Header
+        header = QHBoxLayout()
+        self._title = QLabel("Room Distribution Optimizer")
+        self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#666; font-size:11px;")
+        header.addWidget(self._title)
+        header.addStretch()
+        header.addWidget(self._summary)
+        root.addLayout(header)
+
+        # Controls
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
+        self._min_stats_label = QLabel("Min total stats:")
+        self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(self._min_stats_label)
+
+        self._min_stats_input = QLineEdit()
+        self._min_stats_input.setPlaceholderText("0")
+        self._min_stats_input.setFixedWidth(60)
+        self._min_stats_input.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        controls.addWidget(self._min_stats_input)
+
+        controls.addSpacing(16)
+
+        self._max_risk_label = QLabel("Max inbreeding risk %:")
+        self._max_risk_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(self._max_risk_label)
+
+        self._max_risk_input = QLineEdit()
+        self._max_risk_input.setPlaceholderText("20")
+        self._max_risk_input.setFixedWidth(60)
+        self._max_risk_input.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        controls.addWidget(self._max_risk_input)
+
+        self._optimize_btn = QPushButton("Calculate Optimal Distribution")
+        self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
+        controls.addWidget(self._optimize_btn)
+
+        controls.addStretch()
+        root.addLayout(controls)
+
+        # Results table
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels([
+            "Room", "Cats to Place", "Expected Pairs", "Avg Stats", "Risk%", "Details"
+        ])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setSortingEnabled(False)
+
+        hh = self._table.horizontalHeader()
+        hh.setStretchLastSection(True)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self._table.setColumnWidth(2, 100)
+        self._table.setColumnWidth(3, 90)
+        self._table.setColumnWidth(4, 70)
+
+        root.addWidget(self._table, 1)
+
+        _enforce_min_font_in_widget_tree(self)
+
+    def set_cats(self, cats: list[Cat]):
+        self._cats = cats
+        self._summary.setText(f"{len([c for c in cats if c.status != 'Gone'])} alive cats available")
+
+    def _calculate_optimal_distribution(self):
+        """Calculate and display optimal room distribution."""
+        alive_cats = [c for c in self._cats if c.status != "Gone"]
+
+        # Get minimum stats filter
+        min_stats = 0
+        try:
+            if self._min_stats_input.text().strip():
+                min_stats = int(self._min_stats_input.text().strip())
+        except ValueError:
+            pass
+
+        # Get maximum risk filter
+        max_risk = 100  # Default: allow all
+        try:
+            if self._max_risk_input.text().strip():
+                max_risk = float(self._max_risk_input.text().strip())
+        except ValueError:
+            pass
+
+        # Filter cats by minimum stats
+        if min_stats > 0:
+            alive_cats = [c for c in alive_cats if sum(c.total_stats.values()) >= min_stats]
+
+        if len(alive_cats) < 2:
+            self._table.setRowCount(0)
+            self._summary.setText("Not enough cats to optimize")
+            return
+
+        # Separate males and females
+        males = [c for c in alive_cats if c.gender == "male"]
+        females = [c for c in alive_cats if c.gender == "female"]
+        unknown = [c for c in alive_cats if c.gender == "?"]
+
+        # Sort by total stats (best first)
+        males.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
+        females.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
+        unknown.sort(key=lambda c: sum(c.total_stats.values()), reverse=True)
+
+        available_rooms = list(ROOM_DISPLAY.keys())
+        room_assignments = {room: {'males': [], 'females': [], 'unknown': []} for room in available_rooms}
+
+        # Strategy: Distribute cats across rooms to minimize inbreeding within each room
+        # while maximizing overall stats quality
+
+        # Build family groups - cats that share ancestors should be in different rooms
+        def get_family_group_id(cat):
+            """Get a unique identifier for cat's family lineage."""
+            ancestors = []
+            if cat.parent_a:
+                ancestors.append(cat.parent_a.db_key)
+            if cat.parent_b:
+                ancestors.append(cat.parent_b.db_key)
+            # Include grandparents too
+            for p in [cat.parent_a, cat.parent_b]:
+                if p:
+                    if p.parent_a:
+                        ancestors.append(p.parent_a.db_key)
+                    if p.parent_b:
+                        ancestors.append(p.parent_b.db_key)
+            return tuple(sorted(ancestors)) if ancestors else None
+
+        # Assign cats to rooms using round-robin + family separation strategy
+        room_idx = 0
+        max_cats_per_room = 6
+
+        # Process each gender separately to ensure good distribution
+        for gender_list, gender_key in [(males, 'males'), (females, 'females'), (unknown, 'unknown')]:
+            # Group cats by family
+            family_groups = {}
+            no_family = []
+
+            for cat in gender_list:
+                family_id = get_family_group_id(cat)
+                if family_id:
+                    if family_id not in family_groups:
+                        family_groups[family_id] = []
+                    family_groups[family_id].append(cat)
+                else:
+                    no_family.append(cat)
+
+            # First, distribute family groups across different rooms
+            for family_id, family_cats in family_groups.items():
+                for cat in family_cats:
+                    # Find a room that doesn't have this family yet
+                    placed = False
+                    for attempt in range(len(available_rooms)):
+                        room = available_rooms[room_idx % len(available_rooms)]
+
+                        # Check if this room is suitable
+                        room_data = room_assignments[room]
+                        total_in_room = len(room_data['males']) + len(room_data['females']) + len(room_data['unknown'])
+
+                        if total_in_room < max_cats_per_room:
+                            # Check if any cat in this room shares family with current cat
+                            has_family_conflict = False
+                            has_risk_conflict = False
+
+                            for existing_cat in room_data['males'] + room_data['females'] + room_data['unknown']:
+                                if get_family_group_id(existing_cat) == family_id:
+                                    has_family_conflict = True
+                                    break
+
+                                # Check inbreeding risk if they can breed
+                                ok, _ = can_breed(cat, existing_cat)
+                                if ok:
+                                    risk = risk_percent(cat, existing_cat)
+                                    if risk > max_risk:
+                                        has_risk_conflict = True
+                                        break
+
+                            if not has_family_conflict and not has_risk_conflict:
+                                room_data[gender_key].append(cat)
+                                placed = True
+                                room_idx += 1
+                                break
+
+                        room_idx += 1
+
+                    # If couldn't place due to conflicts, put in least risky room
+                    if not placed:
+                        # Find room with lowest average risk for this cat
+                        best_room = None
+                        best_avg_risk = float('inf')
+
+                        for r in available_rooms:
+                            rd = room_assignments[r]
+                            room_cats = rd['males'] + rd['females'] + rd['unknown']
+
+                            if len(room_cats) >= max_cats_per_room:
+                                continue
+
+                            # Calculate average risk with cats in this room
+                            risks = []
+                            for existing_cat in room_cats:
+                                ok, _ = can_breed(cat, existing_cat)
+                                if ok:
+                                    risks.append(risk_percent(cat, existing_cat))
+
+                            avg_risk = sum(risks) / len(risks) if risks else 0
+
+                            if avg_risk < best_avg_risk:
+                                best_avg_risk = avg_risk
+                                best_room = r
+
+                        if best_room:
+                            room_assignments[best_room][gender_key].append(cat)
+                        else:
+                            # Last resort: put in least full room
+                            least_full_room = min(available_rooms,
+                                key=lambda r: len(room_assignments[r]['males']) +
+                                             len(room_assignments[r]['females']) +
+                                             len(room_assignments[r]['unknown']))
+                            room_assignments[least_full_room][gender_key].append(cat)
+
+            # Then distribute cats without family (strays) - check risk too
+            for cat in no_family:
+                placed = False
+
+                # Try to find a room with acceptable risk
+                for attempt in range(len(available_rooms)):
+                    room = available_rooms[room_idx % len(available_rooms)]
+                    room_data = room_assignments[room]
+                    total_in_room = len(room_data['males']) + len(room_data['females']) + len(room_data['unknown'])
+
+                    if total_in_room < max_cats_per_room:
+                        # Check risk with existing cats
+                        has_risk_conflict = False
+                        for existing_cat in room_data['males'] + room_data['females'] + room_data['unknown']:
+                            ok, _ = can_breed(cat, existing_cat)
+                            if ok:
+                                risk = risk_percent(cat, existing_cat)
+                                if risk > max_risk:
+                                    has_risk_conflict = True
+                                    break
+
+                        if not has_risk_conflict:
+                            room_data[gender_key].append(cat)
+                            placed = True
+                            room_idx += 1
+                            break
+
+                    room_idx += 1
+
+                # If couldn't place, find room with lowest average risk
+                if not placed:
+                    best_room = None
+                    best_avg_risk = float('inf')
+
+                    for r in available_rooms:
+                        rd = room_assignments[r]
+                        room_cats = rd['males'] + rd['females'] + rd['unknown']
+
+                        if len(room_cats) >= max_cats_per_room:
+                            continue
+
+                        # Calculate average risk with cats in this room
+                        risks = []
+                        for existing_cat in room_cats:
+                            ok, _ = can_breed(cat, existing_cat)
+                            if ok:
+                                risks.append(risk_percent(cat, existing_cat))
+
+                        avg_risk = sum(risks) / len(risks) if risks else 0
+
+                        if avg_risk < best_avg_risk:
+                            best_avg_risk = avg_risk
+                            best_room = r
+
+                    if best_room:
+                        room_assignments[best_room][gender_key].append(cat)
+                    else:
+                        # Last resort: least full room
+                        least_full_room = min(available_rooms,
+                            key=lambda r: len(room_assignments[r]['males']) +
+                                         len(room_assignments[r]['females']) +
+                                         len(room_assignments[r]['unknown']))
+                        room_assignments[least_full_room][gender_key].append(cat)
+
+        # Display results
+        self._table.setRowCount(0)
+        row_idx = 0
+        total_pairs = 0
+        total_assigned = 0
+
+        for room in available_rooms:
+            room_data = room_assignments[room]
+            cats_in_room = room_data['males'] + room_data['females'] + room_data['unknown']
+
+            if not cats_in_room:
+                continue
+
+            total_assigned += len(cats_in_room)
+
+            # Calculate expected pairs and outcomes for this room
+            room_pairs = []
+            for i, cat_a in enumerate(cats_in_room):
+                for cat_b in cats_in_room[i+1:]:
+                    ok, _ = can_breed(cat_a, cat_b)
+                    if ok:
+                        risk = risk_percent(cat_a, cat_b)
+                        avg_stats = (sum(cat_a.total_stats.values()) + sum(cat_b.total_stats.values())) / 2
+                        room_pairs.append({'cat_a': cat_a, 'cat_b': cat_b, 'risk': risk, 'avg_stats': avg_stats})
+
+            if not room_pairs:
+                continue
+
+            total_pairs += len(room_pairs)
+
+            self._table.insertRow(row_idx)
+
+            # Room name
+            room_item = QTableWidgetItem(ROOM_DISPLAY.get(room, room))
+            room_item.setTextAlignment(Qt.AlignCenter)
+
+            # Cats to place
+            cat_names = [f"{c.name} ({c.gender_display})" for c in cats_in_room]
+            cats_item = QTableWidgetItem(", ".join(cat_names))
+
+            # Expected pairs
+            pairs_item = QTableWidgetItem(str(len(room_pairs)))
+            pairs_item.setTextAlignment(Qt.AlignCenter)
+
+            # Average stats of expected offspring
+            avg_room_stats = sum(p['avg_stats'] for p in room_pairs) / len(room_pairs)
+            stats_item = QTableWidgetItem(f"{avg_room_stats:.1f}")
+            stats_item.setTextAlignment(Qt.AlignCenter)
+
+            # Color code by stats quality
+            if avg_room_stats >= 200:
+                stats_item.setForeground(QBrush(QColor(98, 194, 135)))
+            elif avg_room_stats >= 150:
+                stats_item.setForeground(QBrush(QColor(143, 201, 230)))
+            else:
+                stats_item.setForeground(QBrush(QColor(190, 145, 40)))
+
+            # Average risk
+            avg_risk = sum(p['risk'] for p in room_pairs) / len(room_pairs)
+            risk_item = QTableWidgetItem(f"{avg_risk:.0f}%")
+            risk_item.setTextAlignment(Qt.AlignCenter)
+
+            # Color code by risk
+            if avg_risk >= 50:
+                risk_item.setForeground(QBrush(QColor(217, 119, 119)))
+            elif avg_risk >= 20:
+                risk_item.setForeground(QBrush(QColor(216, 181, 106)))
+            else:
+                risk_item.setForeground(QBrush(QColor(98, 194, 135)))
+
+            # Details: list all possible pairs
+            details_lines = []
+            for p in room_pairs[:3]:  # Show top 3 pairs
+                details_lines.append(
+                    f"{p['cat_a'].name} × {p['cat_b'].name} "
+                    f"(stats: {p['avg_stats']:.0f}, risk: {p['risk']:.0f}%)"
+                )
+            if len(room_pairs) > 3:
+                details_lines.append(f"... and {len(room_pairs) - 3} more")
+            details_item = QTableWidgetItem("; ".join(details_lines))
+
+            self._table.setItem(row_idx, 0, room_item)
+            self._table.setItem(row_idx, 1, cats_item)
+            self._table.setItem(row_idx, 2, pairs_item)
+            self._table.setItem(row_idx, 3, stats_item)
+            self._table.setItem(row_idx, 4, risk_item)
+            self._table.setItem(row_idx, 5, details_item)
+
+            row_idx += 1
+
+        # Calculate stats
+        filter_info = []
+        if min_stats > 0:
+            filter_info.append(f"min stats: {min_stats}")
+        if max_risk < 100:
+            filter_info.append(f"max risk: {max_risk}%")
+
+        filter_str = f"  |  Filters: {', '.join(filter_info)}" if filter_info else ""
+
+        self._summary.setText(
+            f"Optimized {total_assigned} cats into {row_idx} rooms  |  "
+            f"{total_pairs} total breeding pairs{filter_str}"
+        )
+
+
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
 
 _SIDEBAR_BTN = """
@@ -2417,6 +2844,7 @@ class MainWindow(QMainWindow):
         self._show_lineage: bool = False
         self._tree_view: Optional[FamilyTreeBrowserView] = None
         self._safe_breeding_view: Optional[SafeBreedingView] = None
+        self._room_optimizer_view: Optional[RoomOptimizerView] = None
         self._zoom_percent: int = 100
         self._base_font: QFont = QApplication.instance().font()
         self._base_sidebar_width = 190
@@ -2558,6 +2986,9 @@ class MainWindow(QMainWindow):
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
         self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
         vb.addWidget(self._btn_safe_breeding_view)
+        self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
+        self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
+        vb.addWidget(self._btn_room_optimizer)
         self._btn_tree_view = _sidebar_btn("Family Tree View")
         self._btn_tree_view.clicked.connect(self._open_tree_browser)
         vb.addWidget(self._btn_tree_view)
@@ -2763,6 +3194,9 @@ class MainWindow(QMainWindow):
         self._safe_breeding_view = SafeBreedingView(self)
         self._safe_breeding_view.hide()
         vb.addWidget(self._safe_breeding_view, 1)
+        self._room_optimizer_view = RoomOptimizerView(self)
+        self._room_optimizer_view.hide()
+        vb.addWidget(self._room_optimizer_view, 1)
 
         return w
 
@@ -2808,6 +3242,8 @@ class MainWindow(QMainWindow):
             self._tree_view.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
         if hasattr(self, "_header"):
             self._header.show()
         if hasattr(self, "_table_view_container"):
@@ -2816,6 +3252,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
 
     def _show_tree_view(self):
         if self._active_btn is not None:
@@ -2827,6 +3265,8 @@ class MainWindow(QMainWindow):
             self._table_view_container.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
         if self._tree_view is not None:
             self._tree_view.set_cats(self._cats)
             self._tree_view.show()
@@ -2834,6 +3274,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(True)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
 
     def _show_safe_breeding_view(self):
         if self._active_btn is not None:
@@ -2845,6 +3287,8 @@ class MainWindow(QMainWindow):
             self._table_view_container.hide()
         if hasattr(self, "_tree_view") and self._tree_view is not None:
             self._tree_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
             self._safe_breeding_view.show()
@@ -2852,6 +3296,30 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(True)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
+
+    def _show_room_optimizer_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if self._room_optimizer_view is not None:
+            self._room_optimizer_view.set_cats(self._cats)
+            self._room_optimizer_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(True)
 
     def _update_header(self, room_key):
         if room_key == "__all__":
@@ -2959,6 +3427,9 @@ class MainWindow(QMainWindow):
         cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
         if cats and self._safe_breeding_view is not None:
             self._safe_breeding_view.select_cat(cats[0])
+
+    def _open_room_optimizer(self):
+        self._show_room_optimizer_view()
 
     # ── UI zoom ───────────────────────────────────────────────────────────
 
