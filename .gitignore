@@ -21,6 +21,10 @@ env/
 .idea/
 *.code-workspace
 
+# Claude
+settings.local.json
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
