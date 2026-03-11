@@ -18,6 +18,7 @@ import os
 import math
 from pathlib import Path
 from typing import Optional
+from visual_mutation_catalog import load_visual_mutation_names
 
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
     QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
     QTableWidget, QTableWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QComboBox,
+    QComboBox, QMessageBox,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -94,6 +95,11 @@ APPDATA_SAVE_DIR = os.path.join(
     os.environ.get("APPDATA", ""),
     "Glaiel Games", "Mewgenics",
 )
+APPDATA_CONFIG_DIR = os.path.join(
+    os.environ.get("APPDATA", str(Path.home())),
+    "MewgenicsBreedingManager",
+)
+APP_CONFIG_PATH = os.path.join(APPDATA_CONFIG_DIR, "settings.json")
 
 STAT_COLORS = {
     1: QColor(170, 40,  40),
@@ -388,10 +394,373 @@ _ABILITY_LOOKUP: dict[str, str] = {
 }
 
 
+def _steam_library_paths() -> list[str]:
+    candidates = [
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Steam",
+            "steamapps",
+            "libraryfolders.vdf",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            "Steam",
+            "steamapps",
+            "libraryfolders.vdf",
+        ),
+    ]
+    libraries: list[str] = []
+    for vdf_path in candidates:
+        if not os.path.exists(vdf_path):
+            continue
+        try:
+            with open(vdf_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            for match in re.finditer(r'"path"\s+"([^"]+)"', content):
+                path = match.group(1).replace("\\\\", "\\")
+                if path not in libraries:
+                    libraries.append(path)
+        except Exception:
+            continue
+    return libraries
+
+
+def _load_app_config() -> dict:
+    if not os.path.exists(APP_CONFIG_PATH):
+        return {}
+    try:
+        with open(APP_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_app_config(data: dict):
+    try:
+        os.makedirs(APPDATA_CONFIG_DIR, exist_ok=True)
+        with open(APP_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _saved_gpak_path() -> str:
+    data = _load_app_config()
+    value = data.get("gpak_path", "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _saved_save_dir() -> str:
+    data = _load_app_config()
+    value = data.get("save_dir", "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _save_root_dir() -> str:
+    return _saved_save_dir() or APPDATA_SAVE_DIR
+
+
+def _candidate_gpak_paths() -> list[str]:
+    candidates: list[str] = []
+
+    env_path = os.environ.get("MEWGENICS_GPAK_PATH", "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    direct_paths = [
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Steam", "steamapps", "common", "Mewgenics", "resources.gpak",
+        ),
+        os.path.join(
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            "Steam", "steamapps", "common", "Mewgenics", "resources.gpak",
+        ),
+        r"D:\Games\Mewgenics\resources.gpak",
+        os.path.join(os.getcwd(), "resources.gpak"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources.gpak"),
+        "/mnt/c/Program Files (x86)/Steam/steamapps/common/Mewgenics/resources.gpak",
+        "/mnt/c/Program Files/Steam/steamapps/common/Mewgenics/resources.gpak",
+    ]
+    candidates.extend(direct_paths)
+
+    for library in _steam_library_paths():
+        candidates.append(os.path.join(library, "steamapps", "common", "Mewgenics", "resources.gpak"))
+
+    saved_path = _saved_gpak_path()
+    if saved_path:
+        candidates.append(saved_path)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.normpath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(path)
+    return ordered
+
+
+_GPAK_SEARCH_PATHS = _candidate_gpak_paths()
+_GPAK_PATH = next((p for p in _GPAK_SEARCH_PATHS if os.path.exists(p)), None)
+
+
+def _reload_game_data():
+    global _GPAK_SEARCH_PATHS, _GPAK_PATH, _ABILITY_DESC, _VISUAL_MUT_DATA
+    _GPAK_SEARCH_PATHS = _candidate_gpak_paths()
+    _GPAK_PATH = next((p for p in _GPAK_SEARCH_PATHS if os.path.exists(p)), None)
+    _ABILITY_DESC = _load_ability_descriptions()
+    _VISUAL_MUT_DATA = _load_visual_mut_data()
+
+
+def _set_gpak_path(path: str):
+    cleaned = path.strip()
+    if not cleaned:
+        return
+    data = _load_app_config()
+    data["gpak_path"] = cleaned
+    _save_app_config(data)
+    _reload_game_data()
+
+
+def _set_save_dir(path: str):
+    cleaned = path.strip()
+    if not cleaned:
+        return
+    data = _load_app_config()
+    data["save_dir"] = cleaned
+    _save_app_config(data)
+
+_STAT_LABELS = {
+    "str": "STR",
+    "con": "CON",
+    "int": "INT",
+    "dex": "DEX",
+    "spd": "SPD",
+    "lck": "LCK",
+    "cha": "CHA",
+    "shield": "Shield",
+    "divine_shield": "Holy Shield",
+}
+
+
+def _load_gpak_text_strings(file_obj, file_offsets: dict[str, tuple[int, int]]) -> dict[str, str]:
+    import csv as _csv
+    import io as _io
+
+    strings: dict[str, str] = {}
+    for fname, (csv_off, csv_sz) in file_offsets.items():
+        if not (fname.startswith("data/text/") and fname.endswith(".csv")):
+            continue
+        file_obj.seek(csv_off)
+        raw_csv = file_obj.read(csv_sz).decode("utf-8-sig", errors="replace")
+        for row in _csv.reader(_io.StringIO(raw_csv)):
+            if len(row) >= 2 and row[0] and not row[0].startswith("//"):
+                strings[row[0]] = row[1]
+    return strings
+
+
+def _resolve_game_string(value: str, game_strings: dict[str, str]) -> str:
+    resolved = value
+    seen: set[str] = set()
+    while resolved in game_strings and resolved not in seen:
+        seen.add(resolved)
+        nxt = game_strings[resolved].strip()
+        if not nxt:
+            break
+        resolved = nxt
+    return resolved
+
+
+def _load_ability_descriptions() -> dict[str, str]:
+    """
+    Build {normalized_ability_id: english_desc} by reading ability/passive GON files
+    and combined.csv from the game's gpak. Returns {} if gpak is unavailable.
+    """
+    if not _GPAK_PATH:
+        return {}
+    try:
+        with open(_GPAK_PATH, "rb") as f:
+            count = struct.unpack("<I", f.read(4))[0]
+            entries = []
+            for _ in range(count):
+                name_len = struct.unpack("<H", f.read(2))[0]
+                name = f.read(name_len).decode("utf-8", errors="replace")
+                size = struct.unpack("<I", f.read(4))[0]
+                entries.append((name, size))
+            dir_end = f.tell()
+
+            file_offsets: dict[str, tuple[int, int]] = {}
+            offset = dir_end
+            for name, size in entries:
+                file_offsets[name] = (offset, size)
+                offset += size
+
+            game_strings = _load_gpak_text_strings(f, file_offsets)
+
+            block_re = re.compile(r'^([A-Za-z]\w*)\s*\{', re.MULTILINE)
+            desc_re = re.compile(r'^\s*desc\s+"([^"]*)"', re.MULTILINE)
+
+            def _clean(text: str) -> str:
+                text = re.sub(r'\[img:[^\]]+\]', '', text)
+                text = re.sub(r'\[s:[^\]]*\]|\[/s\]', '', text)
+                text = re.sub(r'\[c:[^\]]*\]|\[/c\]', '', text)
+                return re.sub(r'\s+', ' ', text).strip()
+
+            result: dict[str, str] = {}
+            for fname, (foff, fsz) in file_offsets.items():
+                if not (
+                    (fname.startswith("data/abilities/") or fname.startswith("data/passives/"))
+                    and fname.endswith(".gon")
+                ):
+                    continue
+                f.seek(foff)
+                content = f.read(fsz).decode("utf-8", errors="replace")
+                for bm in block_re.finditer(content):
+                    ability_id = bm.group(1)
+                    block_start = bm.end()
+                    depth, idx = 1, block_start
+                    while idx < len(content) and depth > 0:
+                        if content[idx] == '{':
+                            depth += 1
+                        elif content[idx] == '}':
+                            depth -= 1
+                        idx += 1
+                    block = content[block_start:idx - 1]
+                    dm = desc_re.search(block)
+                    if not dm:
+                        continue
+                    desc_val = dm.group(1)
+                    desc_val = _resolve_game_string(desc_val, game_strings)
+                    if not desc_val or desc_val == "nothing":
+                        continue
+                    result[ability_id.lower()] = _clean(desc_val)
+        return result
+    except Exception:
+        return {}
+
+
+_ABILITY_DESC: dict[str, str] = {}
+
+_MUTATION_DISPLAY_NAMES: dict[str, str] = {
+    "twoedarm": "Two-Toed Arm",
+    "twotoedarm": "Two-Toed Arm",
+    "twoedleg": "Two-Toed Leg",
+    "twotoedleg": "Two-Toed Leg",
+    "conjoinedbody": "Conjoined Body",
+    "lumpybody": "Lumpy Body",
+    "malnourishedbody": "Malnourished Body",
+    "turnersyndrome": "Turner Syndrome",
+    "birdbeakears": "Bird Beak Ears",
+    "floppyears": "Floppy Ears",
+    "inwardeyes": "Inward Eyes",
+    "redeyes": "Red Eyes",
+    "bushyeyebrow": "Bushy Eyebrow",
+    "noeyebrows": "No Eyebrows",
+    "conjoinedtwin": "Conjoined Twin",
+    "bentleg": "Bent Leg",
+    "duckleg": "Duck Leg",
+    "bentarm": "Bent Arm",
+    "nomouth": "No Mouth",
+    "cleftlip": "Cleft Lip",
+    "lumpytail": "Lumpy Tail",
+    "notail": "No Tail",
+    "tailsack": "Tail Sack",
+    "etank": "E-Tank",
+    "deathsdoor": "Death's Door",
+    "mightofthemeek": "Might of the Meek",
+    "minime": "Mini-Me",
+    "jackofalltrades": "Jack of All Trades",
+    "slowandsteady": "Slow and Steady",
+    "huntersboon": "Hunter's Boon",
+    "holymantle": "Holy Mantle",
+    "pawmissile": "Paw Missile",
+    "pawmissle": "Paw Missile",
+    "butcherssoul": "Butcher's Soul",
+    "clericsoul": "Cleric Soul",
+    "druidsoul": "Druid Soul",
+    "fighterssoul": "Fighter's Soul",
+    "hunterssoul": "Hunter's Soul",
+    "jesterssoul": "Jester's Soul",
+    "magessoul": "Mage's Soul",
+    "monkssoul": "Monk's Soul",
+    "necromancerssoul": "Necromancer's Soul",
+    "psychicssoul": "Psychic's Soul",
+    "sorcerersoul": "Sorcerer Soul",
+    "tankssoul": "Tank's Soul",
+    "thiefsoul": "Thief Soul",
+    "tinkerersoul": "Tinkerer Soul",
+    "voidsoul": "Void Soul",
+}
+
+_ABILITY_KEY_ALIASES: dict[str, str] = {
+    "holymantle": "holymantel",
+    "pawmissle": "pawmissile",
+}
+
+
+def _mutation_display_name(name: str) -> str:
+    """Return a human-readable display name for a mutation/ability identifier."""
+    key = re.sub(r'[^a-z0-9]', '', name.lower())
+    if key in _MUTATION_DISPLAY_NAMES:
+        return _MUTATION_DISPLAY_NAMES[key]
+    spaced = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
+    spaced = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', spaced)
+    if spaced == spaced.lower():
+        return spaced.title()
+    return spaced
+
+
 def _ability_tip(name: str) -> str:
     """Return a tooltip description for an ability/mutation name, or '' if unknown."""
     key = re.sub(r'[^a-z0-9]', '', name.lower())
-    return _ABILITY_LOOKUP.get(key, "")
+    key = _ABILITY_KEY_ALIASES.get(key, key)
+    return _ABILITY_DESC.get(key) or _ABILITY_LOOKUP.get(key, "")
+
+
+def _abilities_tooltip(cat: "Cat") -> str:
+    lines: list[str] = []
+    for ability in cat.abilities:
+        tip = _ability_tip(ability)
+        lines.append(ability if not tip else f"{ability}\n{tip}")
+    for passive in cat.passive_abilities:
+        name = _mutation_display_name(passive)
+        tip = _ability_tip(passive)
+        lines.append(f"● {name}" if not tip else f"● {name}\n{tip}")
+    return "\n\n".join(lines)
+
+
+def _mutations_tooltip(cat: "Cat") -> str:
+    return "\n\n".join(tip or text for text, tip in cat.mutation_chip_items)
+
+
+def _ability_effect_lines(cat: "Cat") -> list[str]:
+    lines: list[str] = []
+    for ability in cat.abilities:
+        tip = _ability_tip(ability).strip()
+        if tip:
+            lines.append(f"{ability}: {tip}")
+    for passive in cat.passive_abilities:
+        name = _mutation_display_name(passive)
+        tip = _ability_tip(passive).strip()
+        if tip:
+            lines.append(f"{name}: {tip}")
+    return lines
+
+
+def _mutation_effect_lines(cat: "Cat") -> list[str]:
+    lines: list[str] = []
+    for text, tip in cat.mutation_chip_items:
+        cleaned = tip.strip()
+        if not cleaned:
+            continue
+        if cleaned == text:
+            lines.append(text)
+        else:
+            lines.append(cleaned.replace("\n", " | "))
+    return lines
 
 
 # ── Binary reader ─────────────────────────────────────────────────────────────
@@ -479,59 +848,202 @@ def _scan_blob_for_parent_uids(raw: bytes, uid_set: frozenset, self_uid: int) ->
     return 0, 0
 
 
-# ── Visual mutation scanner ───────────────────────────────────────────────────
+# ── Visual mutation table ─────────────────────────────────────────────────────
 
-# 14 body-part slots (0-indexed); slot_id ≥ 300 in the blob = active mutation
-VISUAL_MUT_NAMES = [
-    "Body", "Head", "Tail", "Eye", "Ear",
-    "Leg", "Paw", "Belly", "Back", "Fur",
-    "Wing", "Horn", "Fang", "Mark",
+_VISUAL_MUTATION_FIELDS = [
+    ("fur", 0, "fur", "texture", "fur", "Fur"),
+    ("body", 3, "body", "body", "body", "Body"),
+    ("head", 8, "head", "head", "head", "Head"),
+    ("tail", 13, "tail", "tail", "tail", "Tail"),
+    ("leg_L", 18, "legs", "legs", "legs", "Left Leg"),
+    ("leg_R", 23, "legs", "legs", "legs", "Right Leg"),
+    ("arm_L", 28, "arms", "legs", "legs", "Left Arm"),
+    ("arm_R", 33, "arms", "legs", "legs", "Right Arm"),
+    ("eye_L", 38, "eyes", "eyes", "eyes", "Left Eye"),
+    ("eye_R", 43, "eyes", "eyes", "eyes", "Right Eye"),
+    ("eyebrow_L", 48, "eyebrows", "eyebrows", "eyebrows", "Left Eyebrow"),
+    ("eyebrow_R", 53, "eyebrows", "eyebrows", "eyebrows", "Right Eyebrow"),
+    ("ear_L", 58, "ears", "ears", "ears", "Left Ear"),
+    ("ear_R", 63, "ears", "ears", "ears", "Right Ear"),
+    ("mouth", 68, "mouth", "mouth", "mouth", "Mouth"),
 ]
 
-def _find_mutation_table(raw: bytes) -> int:
-    """
-    Locate the 296-byte visual-mutation table by scanning for its header:
-      entry-0: f32 scale [0.05, 20.0], u32 coat_id [1, 20000], u32 small ≤ 500,
-               u32 sentinel (0 or ≤ 5000)
-      entries 1-14: 20 bytes each, second u32 (coat_id or 0) validated for ≥10 slots.
-    Returns base offset, or -1 if not found.
-    """
-    size = 16 + 14 * 20   # 296 bytes
-    limit = len(raw) - size
-    for base in range(limit):
-        scale = struct.unpack_from('<f', raw, base)[0]
-        if not (0.05 <= scale <= 20.0):
-            continue
-        coat = struct.unpack_from('<I', raw, base + 4)[0]
-        if coat == 0 or coat > 20_000:
-            continue
-        t1 = struct.unpack_from('<I', raw, base + 8)[0]
-        if t1 > 500:
-            continue
-        t2 = struct.unpack_from('<I', raw, base + 12)[0]
-        if t2 != 0xFFFF_FFFF and t2 > 5_000:
-            continue
-        matches = sum(
-            1 for i in range(14)
-            if struct.unpack_from('<I', raw, base + 16 + i * 20 + 4)[0] in (coat, 0)
-        )
-        if matches >= 10:
-            return base
-    return -1
+_VISUAL_MUTATION_PART_LABELS = {
+    "fur": "Fur",
+    "body": "Body",
+    "head": "Head",
+    "tail": "Tail",
+    "legs": "Leg",
+    "arms": "Arm",
+    "eyes": "Eye",
+    "eyebrows": "Eyebrow",
+    "ears": "Ear",
+    "mouth": "Mouth",
+}
 
 
-def _read_visual_mutations(raw: bytes) -> list:
-    """Return list of active visual-mutation names (e.g. 'Eye Mutation')."""
-    base = _find_mutation_table(raw)
-    if base == -1:
-        return []
-    result = []
-    for i in range(14):
-        slot_id = struct.unpack_from('<I', raw, base + 16 + i * 20)[0]
-        if slot_id >= 300:
-            name = VISUAL_MUT_NAMES[i] if i < len(VISUAL_MUT_NAMES) else f"Mutation{i+1}"
-            result.append(f"{name} Mutation")
+def _parse_mutation_gon(content: str, game_strings: dict[str, str], category: str) -> dict[int, tuple[str, str]]:
+    """Parse a mutation GON file into {slot_id: (display_name, stat_desc)}."""
+    result: dict[int, tuple[str, str]] = {}
+    csv_prefix = f"MUTATION_{category.upper()}_"
+    idx = 0
+    while idx < len(content):
+        match = re.search(r'(?<!\w)(\d{3,})\s*\{', content[idx:])
+        if not match:
+            break
+        slot_id = int(match.group(1))
+        block_start = idx + match.end()
+        depth, block_end = 1, block_start
+        while block_end < len(content) and depth > 0:
+            if content[block_end] == '{':
+                depth += 1
+            elif content[block_end] == '}':
+                depth -= 1
+            block_end += 1
+        block = content[block_start:block_end - 1]
+        idx = block_end
+        if slot_id < 300:
+            continue
+
+        name_match = re.search(r'//\s*(.+)', block)
+        raw_name = name_match.group(1).strip().title() if name_match else f"Mutation {slot_id}"
+        csv_key = f"{csv_prefix}{slot_id}_DESC"
+        if csv_key in game_strings:
+            stat_desc = _resolve_game_string(game_strings[csv_key], game_strings).strip().rstrip(".")
+        else:
+            header = block.split('{')[0]
+            stats: list[str] = []
+            for key, label in _STAT_LABELS.items():
+                stat_match = re.search(rf'(?<!\w){re.escape(key)}\s+(-?\d+)', header)
+                if stat_match:
+                    value = int(stat_match.group(1))
+                    stats.append(f"{'+' if value > 0 else ''}{value} {label}")
+            stat_desc = ", ".join(stats)
+        result[slot_id] = (raw_name, stat_desc)
     return result
+
+
+def _load_visual_mut_data() -> dict[str, dict[int, tuple[str, str]]]:
+    """Load {gon_category: {slot_id: (name, stat_desc)}} from resources.gpak."""
+    if not _GPAK_PATH:
+        return {}
+    try:
+        with open(_GPAK_PATH, "rb") as f:
+            count = struct.unpack("<I", f.read(4))[0]
+            entries = []
+            for _ in range(count):
+                name_len = struct.unpack("<H", f.read(2))[0]
+                name = f.read(name_len).decode("utf-8", errors="replace")
+                size = struct.unpack("<I", f.read(4))[0]
+                entries.append((name, size))
+            dir_end = f.tell()
+
+            file_offsets: dict[str, tuple[int, int]] = {}
+            offset = dir_end
+            for name, size in entries:
+                file_offsets[name] = (offset, size)
+                offset += size
+
+            game_strings = _load_gpak_text_strings(f, file_offsets)
+
+            result: dict[str, dict[int, tuple[str, str]]] = {}
+            for fname, (foff, fsz) in file_offsets.items():
+                if not (fname.startswith("data/mutations/") and fname.endswith(".gon")):
+                    continue
+                category = fname.split("/")[-1].replace(".gon", "")
+                f.seek(foff)
+                content = f.read(fsz).decode("utf-8", errors="replace")
+                result[category] = _parse_mutation_gon(content, game_strings, category)
+        return result
+    except Exception:
+        return {}
+
+
+_VISUAL_MUT_DATA = {}
+_reload_game_data()
+
+
+def _read_visual_mutation_entries(table: list[int]) -> list[dict[str, object]]:
+    fallback_names = load_visual_mutation_names()
+    entries: list[dict[str, object]] = []
+    for slot_key, table_index, group_key, gpak_category, fallback_part, slot_label in _VISUAL_MUTATION_FIELDS:
+        mutation_id = table[table_index] if table_index < len(table) else 0
+        if mutation_id in (0, 0xFFFF_FFFF):
+            continue
+
+        display_name = ""
+        detail = ""
+        gpak_info = _VISUAL_MUT_DATA.get(gpak_category, {}).get(mutation_id)
+        if gpak_info:
+            raw_name, stat_desc = gpak_info
+            if re.match(r'^Mutation \d+$', raw_name):
+                display_name = f"{_VISUAL_MUTATION_PART_LABELS.get(group_key, slot_label)} Mutation"
+            else:
+                display_name = raw_name
+            detail = stat_desc
+        else:
+            fallback_name = fallback_names.get((fallback_part, mutation_id))
+            if fallback_name is None:
+                if mutation_id < 300:
+                    continue
+                fallback_name = f"{_VISUAL_MUTATION_PART_LABELS.get(group_key, slot_label)} {mutation_id}"
+            display_name = fallback_name
+
+        display_name = str(display_name).strip() or f"{slot_label} {mutation_id}"
+        entries.append({
+            "slot_key": slot_key,
+            "slot_label": slot_label,
+            "group_key": group_key,
+            "part_label": _VISUAL_MUTATION_PART_LABELS.get(group_key, slot_label),
+            "mutation_id": mutation_id,
+            "name": display_name,
+            "detail": str(detail).strip(),
+        })
+    return entries
+
+
+def _visual_mutation_chip_items(entries: list[dict[str, object]]) -> list[tuple[str, str]]:
+    grouped: dict[tuple[str, int], list[dict[str, object]]] = {}
+    order: list[tuple[str, int]] = []
+    for entry in entries:
+        key = (str(entry["group_key"]), int(entry["mutation_id"]))
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(entry)
+
+    groups: list[dict[str, object]] = []
+    for key in order:
+        items = grouped[key]
+        slot_labels = [str(item["slot_label"]) for item in items]
+        name = str(items[0]["name"])
+        mutation_id = int(items[0]["mutation_id"])
+        part_label = str(items[0]["part_label"])
+        detail = str(items[0]["detail"]).strip()
+        title_label = part_label if len(slot_labels) > 1 else str(items[0]["slot_label"])
+        tooltip = f"{title_label} Mutation (ID {mutation_id})\n{name}"
+        if detail:
+            tooltip = f"{tooltip}\n{detail}"
+        if len(slot_labels) > 1:
+            tooltip = f"{tooltip}\nAffects: {', '.join(slot_labels)}"
+        groups.append({
+            "text": name,
+            "tooltip": tooltip,
+            "slot_labels": slot_labels,
+        })
+
+    text_counts: dict[str, int] = {}
+    for group in groups:
+        text = str(group["text"])
+        text_counts[text] = text_counts.get(text, 0) + 1
+
+    chip_items: list[tuple[str, str]] = []
+    for group in groups:
+        text = str(group["text"])
+        if text_counts[text] > 1:
+            text = f"{text} ({' / '.join(group['slot_labels'])})"
+        chip_items.append((text, str(group["tooltip"])))
+    return chip_items
 
 
 # ── Cat ───────────────────────────────────────────────────────────────────────
@@ -543,6 +1055,7 @@ class Cat:
     generation: int = 0   # generation depth: 0=stray, 1=child of strays, etc.
     is_blacklisted: bool = False  # exclude from breeding calculations
     must_breed: bool = False  # prioritize in breeding optimization
+    passive_abilities: list[str]
 
     def __init__(self, blob: bytes, cat_key: int, house_info: dict, adventure_keys: set):
         uncomp_size = struct.unpack('<I', blob[:4])[0]
@@ -585,7 +1098,15 @@ class Cat:
         r.skip(64)
         T = [r.u32() for _ in range(72)]
         self.body_parts = {"texture": T[0], "bodyShape": T[3], "headShape": T[8]}
-        self.visual_mutation_ids = [T[i] for i in range(14, 29) if i < 72 and T[i] != 0]
+        self.visual_mutation_slots = {
+            slot_key: T[table_index]
+            for slot_key, table_index, *_ in _VISUAL_MUTATION_FIELDS
+            if table_index < len(T)
+        }
+        visual_entries = _read_visual_mutation_entries(T)
+        visual_items = _visual_mutation_chip_items(visual_entries)
+        self.visual_mutation_ids = [int(entry["mutation_id"]) for entry in visual_entries]
+        visual_display_names = [text for text, _ in visual_items]
 
         r.skip(12)
         raw_gender = r.str()
@@ -710,7 +1231,7 @@ class Cat:
                 except Exception:
                     pass
 
-            self.mutations = passives
+            self.passive_abilities = passives
             self.equipment = []   # equipment parsing requires separate byte-marker logic
 
         else:
@@ -729,10 +1250,10 @@ class Cat:
             self.abilities = [a for a in [r.str() for _ in range(6)] if _valid_str(a)]
             self.equipment = [s for s in [r.str() for _ in range(4)] if _valid_str(s)]
 
-            self.mutations = []
+            self.passive_abilities = []
             first = r.str()
             if _valid_str(first):
-                self.mutations.append(first)
+                self.passive_abilities.append(first)
             for _ in range(13):
                 if r.remaining() < 12:
                     break
@@ -741,13 +1262,10 @@ class Cat:
                     break
                 p = r.str()
                 if _valid_str(p):
-                    self.mutations.append(p)
+                    self.passive_abilities.append(p)
 
-        # Visual mutations from the 296-byte fixed mutation table (prepend so they
-        # show first; passive trait strings from the ability run follow)
-        vis = _read_visual_mutations(raw)
-        if vis:
-            self.mutations = vis + self.mutations
+        self.mutations = visual_display_names
+        self.mutation_chip_items = visual_items
 
         # Legacy token fallback is already handled above when sex_code is unavailable.
 
@@ -1116,7 +1634,7 @@ def parse_save(path: str) -> tuple[list, list]:
 
 def find_save_files() -> list[str]:
     saves = []
-    base  = Path(APPDATA_SAVE_DIR)
+    base  = Path(_save_root_dir())
     if not base.is_dir():
         return saves
     for profile in base.iterdir():
@@ -1647,9 +2165,10 @@ class CatTableModel(QAbstractTableModel):
             if col == COL_SUM:
                 return str(sum(cat.base_stats.values()))
             if col == COL_MUTS:
-                return ", ".join(cat.mutations)
+                return ", ".join(_mutation_display_name(m) for m in cat.mutations)
             if col == COL_ABIL:
-                return ", ".join(cat.abilities)
+                parts = list(cat.abilities) + [f"● {_mutation_display_name(p)}" for p in cat.passive_abilities]
+                return ", ".join(parts)
             if col == COL_REL:
                 if self._focus_cat is None:
                     return "—"
@@ -1752,9 +2271,9 @@ class CatTableModel(QAbstractTableModel):
             if col == COL_MB:
                 return "Must breed - prioritized in optimization" if cat.must_breed else "Normal breeding priority"
             if col == COL_MUTS and cat.mutations:
-                return "\n".join(cat.mutations)
-            if col == COL_ABIL and cat.abilities:
-                return "\n".join(cat.abilities)
+                return _mutations_tooltip(cat)
+            if col == COL_ABIL and (cat.abilities or cat.passive_abilities):
+                return _abilities_tooltip(cat)
             if col == COL_AGG:
                 if cat.aggression is None:
                     return "Aggression: unknown"
@@ -1829,11 +2348,30 @@ class RoomFilterModel(QSortFilterProxyModel):
         self._name_filter = text.strip().lower()
         self.invalidate()
 
+    def _matches_text_filter(self, cat: Cat) -> bool:
+        if not self._name_filter:
+            return True
+
+        terms = [cat.name]
+        terms.extend(cat.abilities)
+        terms.extend(cat.passive_abilities)
+        terms.extend(_mutation_display_name(p) for p in cat.passive_abilities)
+        terms.extend(cat.mutations)
+        terms.extend(_mutation_display_name(m) for m in cat.mutations)
+        terms.extend(text for text, _ in getattr(cat, "mutation_chip_items", []))
+
+        haystack = " ".join(
+            str(term).lower()
+            for term in terms
+            if term
+        )
+        return self._name_filter in haystack
+
     def filterAcceptsRow(self, source_row, source_parent):
         cat = self.sourceModel().cat_at(source_row)
         if cat is None:
             return False
-        if self._name_filter and self._name_filter not in cat.name.lower():
+        if not self._matches_text_filter(cat):
             return False
         if self._room == "__all__":
             return True
@@ -1857,6 +2395,8 @@ _WARN_STYLE = "color:#e07050; font-size:11px; font-weight:bold;"
 _SAFE_STYLE = "color:#50c080; font-size:11px;"
 _ANCS_STYLE = "color:#aaa; font-size:11px;"
 _PANEL_BG   = "background:#0a0a18; border-top:1px solid #1e1e38;"
+_DETAIL_TEXT_STYLE = "color:#d7d7e6; font-size:11px;"
+_NOTE_STYLE = "color:#666; font-size:10px;"
 
 
 def _chip(text: str, tooltip: str = "") -> QLabel:
@@ -1878,15 +2418,33 @@ def _vsep() -> QFrame:
     return f
 
 
+def _detail_text_block(lines: list[str], style: str = _DETAIL_TEXT_STYLE) -> QWidget:
+    box = QWidget()
+    layout = QVBoxLayout(box)
+    layout.setContentsMargins(0, 2, 0, 0)
+    layout.setSpacing(4)
+    for line in lines:
+        lbl = QLabel(line)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(style)
+        layout.addWidget(lbl)
+    return box
+
+
 class ChipRow(QWidget):
-    def __init__(self, items: list[str], tooltip_fn=None):
+    def __init__(self, items, tooltip_fn=None, display_fn=None):
         super().__init__()
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(5)
         for item in items:
-            tip = tooltip_fn(item) if tooltip_fn else ""
-            row.addWidget(_chip(item, tip))
+            if isinstance(item, tuple):
+                text, tip = item
+                tip = tip or (tooltip_fn(text) if tooltip_fn else "")
+            else:
+                text = display_fn(item) if display_fn else item
+                tip = tooltip_fn(item) if tooltip_fn else ""
+            row.addWidget(_chip(text, tip))
         row.addStretch()
 
 
@@ -1950,27 +2508,67 @@ class CatDetailPanel(QWidget):
         id_col.addLayout(name_row)
         id_col.addWidget(QLabel(cat.room_display or "—", styleSheet=_META_STYLE))
 
-        # Stats: show all 7; highlight any that are modified
-        has_mods = any(cat.total_stats[n] != cat.base_stats[n] for n in STAT_NAMES)
-        if has_mods:
-            id_col.addSpacing(4)
-            stat_row = QHBoxLayout(); stat_row.setSpacing(6)
-            for n in STAT_NAMES:
-                base = cat.base_stats[n]
-                total = cat.total_stats[n]
-                if total != base:
-                    delta = total - base
-                    sign  = "+" if delta > 0 else ""
-                    text  = f"{n} {base}{sign}{delta}"
-                    col_s = "#5a9" if delta > 0 else "#c55"
-                else:
-                    text  = f"{n} {base}"
-                    col_s = "#555"
-                lbl = QLabel(text)
-                lbl.setStyleSheet(f"color:{col_s}; font-size:10px;")
-                stat_row.addWidget(lbl)
-            stat_row.addStretch()
-            id_col.addLayout(stat_row)
+        # Stats: compact grid with shared Base / Mod / Total row labels.
+        id_col.addSpacing(4)
+        stats_box = QWidget()
+        stats_box.setStyleSheet("background:#101024; border:1px solid #1e1e38; border-radius:4px;")
+        stats_grid = QGridLayout(stats_box)
+        stats_grid.setContentsMargins(6, 4, 6, 4)
+        stats_grid.setHorizontalSpacing(6)
+        stats_grid.setVerticalSpacing(1)
+        stats_box.setMinimumWidth(280)
+
+        corner = QLabel("")
+        corner.setStyleSheet("color:#888; font-size:9px;")
+        stats_grid.addWidget(corner, 0, 0)
+        stats_grid.setColumnMinimumWidth(0, 34)
+
+        for col, stat_name in enumerate(STAT_NAMES, start=1):
+            head = QLabel(stat_name)
+            head.setStyleSheet("color:#888; font-size:9px; font-weight:bold;")
+            head.setAlignment(Qt.AlignCenter)
+            stats_grid.addWidget(head, 0, col)
+            stats_grid.setColumnMinimumWidth(col, 28)
+
+        for row, label in enumerate(("Base", "Mod", "Total"), start=1):
+            row_lbl = QLabel(label)
+            row_lbl.setStyleSheet("color:#777; font-size:9px; font-weight:bold;")
+            stats_grid.addWidget(row_lbl, row, 0)
+
+        for col, stat_name in enumerate(STAT_NAMES, start=1):
+            base = cat.base_stats[stat_name]
+            total = cat.total_stats[stat_name]
+            delta = total - base
+            delta_sign = "+" if delta > 0 else ""
+            delta_color = "#5a9" if delta > 0 else ("#c55" if delta < 0 else "#888")
+            base_bg = STAT_COLORS.get(base, QColor(45, 45, 60)).name()
+            total_bg = STAT_COLORS.get(total, QColor(45, 45, 60)).name()
+
+            base_lbl = QLabel(str(base))
+            base_lbl.setStyleSheet(
+                f"background:{base_bg}; color:#fff; font-size:9px; font-weight:bold;"
+                "border-radius:3px; padding:1px 4px;"
+            )
+            base_lbl.setAlignment(Qt.AlignCenter)
+            stats_grid.addWidget(base_lbl, 1, col)
+
+            mod_lbl = QLabel(f"{delta_sign}{delta}")
+            mod_lbl.setStyleSheet(
+                f"background:{'#183820' if delta > 0 else ('#3a1818' if delta < 0 else '#101024')};"
+                f"color:{delta_color}; font-size:9px; border-radius:3px; padding:1px 4px;"
+            )
+            mod_lbl.setAlignment(Qt.AlignCenter)
+            stats_grid.addWidget(mod_lbl, 2, col)
+
+            total_lbl = QLabel(str(total))
+            total_lbl.setStyleSheet(
+                f"background:{total_bg}; color:#fff; font-size:9px; font-weight:bold;"
+                "border-radius:3px; padding:1px 4px;"
+            )
+            total_lbl.setAlignment(Qt.AlignCenter)
+            stats_grid.addWidget(total_lbl, 3, col)
+
+        id_col.addWidget(stats_box)
 
         def _navigate(target: Cat):
             mw = self.window()
@@ -2043,11 +2641,26 @@ class CatDetailPanel(QWidget):
         root.addLayout(id_col)
 
         # Abilities
-        if cat.abilities:
+        if cat.abilities or cat.passive_abilities:
             root.addWidget(_vsep())
             ab = QVBoxLayout(); ab.setSpacing(4)
             ab.addWidget(_sec("ABILITIES"))
             ab.addWidget(ChipRow(cat.abilities, tooltip_fn=_ability_tip))
+            if cat.passive_abilities:
+                ab.addWidget(_sec("PASSIVE"))
+                ab.addWidget(ChipRow(
+                    cat.passive_abilities,
+                    tooltip_fn=_ability_tip,
+                    display_fn=lambda n: f"● {_mutation_display_name(n)}",
+                ))
+            ability_lines = _ability_effect_lines(cat)
+            if ability_lines:
+                ab.addWidget(_detail_text_block(ability_lines))
+            elif not _GPAK_PATH:
+                ab.addWidget(_detail_text_block(
+                    ["Ability descriptions unavailable. Set MEWGENICS_GPAK_PATH or place resources.gpak next to the app."],
+                    style=_NOTE_STYLE,
+                ))
             ab.addStretch()
             root.addLayout(ab)
 
@@ -2056,7 +2669,15 @@ class CatDetailPanel(QWidget):
             root.addWidget(_vsep())
             mu = QVBoxLayout(); mu.setSpacing(4)
             mu.addWidget(_sec("MUTATIONS"))
-            mu.addWidget(ChipRow(cat.mutations, tooltip_fn=_ability_tip))
+            mu.addWidget(ChipRow(cat.mutation_chip_items, tooltip_fn=_ability_tip))
+            mutation_lines = _mutation_effect_lines(cat)
+            if mutation_lines:
+                mu.addWidget(_detail_text_block(mutation_lines))
+            elif not _GPAK_PATH:
+                mu.addWidget(_detail_text_block(
+                    ["Mutation effect text unavailable. Set MEWGENICS_GPAK_PATH or place resources.gpak next to the app."],
+                    style=_NOTE_STYLE,
+                ))
             mu.addStretch()
             root.addLayout(mu)
 
@@ -2294,12 +2915,14 @@ class CatDetailPanel(QWidget):
         ab_col.setSpacing(6)
         ab_col.addWidget(_sec("ABILITIES"))
         for cat in (a, b):
-            if cat.abilities:
+            if cat.abilities or cat.passive_abilities:
                 row = QHBoxLayout()
                 row.setSpacing(5)
                 row.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
                 for ab in cat.abilities:
                     row.addWidget(_chip(ab, _ability_tip(ab)))
+                for pa in cat.passive_abilities:
+                    row.addWidget(_chip(f"● {_mutation_display_name(pa)}", _ability_tip(pa)))
                 row.addStretch()
                 ab_col.addLayout(row)
         ab_col.addStretch()
@@ -2320,8 +2943,8 @@ class CatDetailPanel(QWidget):
                     mrow = QHBoxLayout()
                     mrow.setSpacing(5)
                     mrow.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
-                    for mut in cat.mutations:
-                        mrow.addWidget(_chip(mut, _ability_tip(mut)))
+                    for text, tip in cat.mutation_chip_items:
+                        mrow.addWidget(_chip(text, tip))
                     mrow.addStretch()
                     mc.addLayout(mrow)
             mc.addStretch()
@@ -4236,6 +4859,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         fm = self.menuBar().addMenu("File")
+        self._file_menu = fm
 
         oa = QAction("Open Save File…", self)
         oa.setShortcut("Ctrl+O")
@@ -4247,13 +4871,16 @@ class MainWindow(QMainWindow):
         ra.triggered.connect(self._reload)
         fm.addAction(ra)
 
-        fm.addSeparator()
-        for path in find_save_files():
-            a = QAction(os.path.basename(path), self)
-            a.triggered.connect(lambda _, p=path: self.load_save(p))
-            fm.addAction(a)
+        self._recent_saves_separator = fm.addSeparator()
+        self._recent_save_actions: list[QAction] = []
+        self._refresh_recent_save_actions()
 
         sm = self.menuBar().addMenu("Settings")
+        locations_action = QAction("Locations…", self)
+        locations_action.triggered.connect(self._open_locations_dialog)
+        sm.addAction(locations_action)
+
+        sm.addSeparator()
         self._lineage_action = QAction("Show Family Tree && Inbreeding", self)
         self._lineage_action.setCheckable(True)
         self._lineage_action.setChecked(False)
@@ -4291,6 +4918,126 @@ class MainWindow(QMainWindow):
         self._zoom_info_action.setEnabled(False)
         sm.addAction(self._zoom_info_action)
         self._update_zoom_info_action()
+
+    def _refresh_recent_save_actions(self):
+        if not hasattr(self, "_file_menu"):
+            return
+        for action in getattr(self, "_recent_save_actions", []):
+            self._file_menu.removeAction(action)
+        self._recent_save_actions = []
+
+        saves = find_save_files()
+        if not saves:
+            action = QAction(f"No saves found in {_save_root_dir()}", self)
+            action.setEnabled(False)
+            self._file_menu.addAction(action)
+            self._recent_save_actions.append(action)
+            return
+
+        for path in saves[:10]:
+            action = QAction(os.path.basename(path), self)
+            action.setToolTip(path)
+            action.triggered.connect(lambda _, p=path: self.load_save(p))
+            self._file_menu.addAction(action)
+            self._recent_save_actions.append(action)
+
+    def _open_locations_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Locations")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        game_title = QLabel("Game Install")
+        game_title.setStyleSheet(_NAME_STYLE)
+        game_path_label = QLabel()
+        game_path_label.setWordWrap(True)
+        game_path_label.setStyleSheet(_META_STYLE)
+
+        save_title = QLabel("Save Root")
+        save_title.setStyleSheet(_NAME_STYLE)
+        save_path_label = QLabel()
+        save_path_label.setWordWrap(True)
+        save_path_label.setStyleSheet(_META_STYLE)
+
+        note_label = QLabel(
+            f"Default save root: {APPDATA_SAVE_DIR}\n"
+            "The save root should contain profile folders with a nested saves directory."
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet(_META_STYLE)
+
+        def _refresh_labels():
+            game_path_label.setText(_GPAK_PATH or "Not found")
+            save_path_label.setText(_save_root_dir())
+
+        def _choose_game_dir():
+            start_dir = os.path.dirname(_GPAK_PATH) if _GPAK_PATH else (
+                r"C:\Program Files (x86)\Steam\steamapps\common\Mewgenics"
+                if os.path.isdir(r"C:\Program Files (x86)\Steam\steamapps\common\Mewgenics")
+                else (
+                    r"C:\Program Files\Steam\steamapps\common\Mewgenics"
+                    if os.path.isdir(r"C:\Program Files\Steam\steamapps\common\Mewgenics")
+                    else str(Path.home())
+                )
+            )
+            chosen_dir = QFileDialog.getExistingDirectory(
+                dlg,
+                "Select Mewgenics Install Folder",
+                start_dir,
+            )
+            if not chosen_dir:
+                return
+            gpak_path = os.path.join(chosen_dir, "resources.gpak")
+            if not os.path.exists(gpak_path):
+                QMessageBox.warning(
+                    dlg,
+                    "resources.gpak not found",
+                    "The selected folder does not contain resources.gpak.",
+                )
+                return
+            _set_gpak_path(gpak_path)
+            _refresh_labels()
+            if self._current_save:
+                self.load_save(self._current_save)
+            self.statusBar().showMessage(f"Using game data from {gpak_path}")
+
+        def _choose_save_dir():
+            chosen_dir = QFileDialog.getExistingDirectory(
+                dlg,
+                "Select Mewgenics Save Root",
+                _save_root_dir(),
+            )
+            if not chosen_dir:
+                return
+            _set_save_dir(chosen_dir)
+            _refresh_labels()
+            self._refresh_recent_save_actions()
+            self.statusBar().showMessage(f"Using save root {chosen_dir}")
+
+        game_btn = QPushButton("Change Game Folder…")
+        game_btn.clicked.connect(_choose_game_dir)
+        save_btn = QPushButton("Change Save Root…")
+        save_btn.clicked.connect(_choose_save_dir)
+
+        layout.addWidget(game_title)
+        layout.addWidget(game_path_label)
+        layout.addWidget(game_btn)
+        layout.addSpacing(8)
+        layout.addWidget(save_title)
+        layout.addWidget(save_path_label)
+        layout.addWidget(save_btn)
+        layout.addSpacing(8)
+        layout.addWidget(note_label)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+
+        _refresh_labels()
+        dlg.resize(640, 260)
+        dlg.exec()
 
     # ── Layout ────────────────────────────────────────────────────────────
 
@@ -4431,7 +5178,7 @@ class MainWindow(QMainWindow):
         self._summary_lbl = QLabel("")
         self._summary_lbl.setStyleSheet("color:#4a7a9a; font-size:11px;")
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search…")
+        self._search.setPlaceholderText("Search cats, abilities, mutations…")
         self._search.setClearButtonEnabled(True)
         self._search.setFixedWidth(self._base_search_width)
         self._search.setStyleSheet(
@@ -4472,11 +5219,8 @@ class MainWindow(QMainWindow):
         self._table.verticalHeader().setVisible(False)
         self._table.setShowGrid(False)
         self._table.setWordWrap(False)
-        # Enable editing for checkboxes while keeping other cells read-only via model flags
-        self._table.setEditTriggers(
-            QAbstractItemView.CurrentChanged |
-            QAbstractItemView.SelectedClicked
-        )
+        # Checkbox columns are toggled explicitly in _on_table_clicked.
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
         hh = self._table.horizontalHeader()
         hh.setStretchLastSection(False)  # we control stretch manually
@@ -4603,7 +5347,7 @@ class MainWindow(QMainWindow):
             self._safe_breeding_view.select_cat(focus)
 
     def _on_table_clicked(self, proxy_index: QModelIndex):
-        if not proxy_index.isValid() or proxy_index.column() != COL_BL:
+        if not proxy_index.isValid() or proxy_index.column() not in (COL_BL, COL_MB):
             return
         src_index = self._proxy_model.mapToSource(proxy_index)
         if not src_index.isValid():
@@ -4961,6 +5705,39 @@ def _hsep() -> QFrame:
     return f
 
 
+def _ensure_gpak_path_interactive(parent: Optional[QWidget] = None):
+    if _GPAK_PATH:
+        return
+
+    if os.path.isdir(r"C:\Program Files (x86)\Steam\steamapps\common\Mewgenics"):
+        start_dir = r"C:\Program Files (x86)\Steam\steamapps\common\Mewgenics"
+    elif os.path.isdir(r"C:\Program Files\Steam\steamapps\common\Mewgenics"):
+        start_dir = r"C:\Program Files\Steam\steamapps\common\Mewgenics"
+    elif os.path.isdir(r"D:\Games\Mewgenics"):
+        start_dir = r"D:\Games\Mewgenics"
+    else:
+        start_dir = str(Path.home())
+    chosen_dir = QFileDialog.getExistingDirectory(
+        parent,
+        "Select Mewgenics Install Folder",
+        start_dir,
+    )
+    if not chosen_dir:
+        return
+
+    gpak_path = os.path.join(chosen_dir, "resources.gpak")
+    if os.path.exists(gpak_path):
+        _set_gpak_path(gpak_path)
+        return
+
+    QMessageBox.warning(
+        parent,
+        "resources.gpak not found",
+        "The selected folder does not contain resources.gpak. "
+        "Choose the Mewgenics install directory that contains that file.",
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -4980,6 +5757,15 @@ def main():
     pal.setColor(QPalette.ToolTipBase,     QColor(20,  20,  40))
     pal.setColor(QPalette.ToolTipText,     QColor(220, 220, 230))
     app.setPalette(pal)
+
+    if not _GPAK_PATH:
+        QMessageBox.information(
+            None,
+            "Locate Mewgenics",
+            "Ability and mutation descriptions need the game's resources.gpak.\n"
+            "Select your Mewgenics install folder to enable them.",
+        )
+        _ensure_gpak_path_interactive()
 
     win = MainWindow()
     win.show()
