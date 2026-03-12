@@ -24,14 +24,26 @@ It reads your save, shows the cats in a sortable live table, and adds planning v
 ### Breeding Comparison View
 ![Breeding Comparison View](Sceenshots/Breeding%20Cats%20View.png)
 
-### Safe Breeding
+### Safe Breeding View
 ![Safe Breeding](Sceenshots/Safe%20Breeding.png)
+
+### Donation Candidates
+![Donation Candidates](Sceenshots/Donation%20Candidates.png)
+
+### Exceptional Cats
+![Exceptional Cats](Sceenshots/Exceptional%20Cats.png)
+
+### Breeding Partners
+![Breeding Partners](Sceenshots/Breeding%20Partners.png)
 
 ### Family Tree View
 ![Family Tree View](Sceenshots/Family%20Tree%20View.png)
 
 ### Room Optimizer
 ![Room Optimizer](Sceenshots/Room%20Optimizer.png)
+
+### Perfect 7 Planner
+![Perfect 7 Planner](Sceenshots/Perfect%207%20Planner.png)
 
 ## Main Features
 
