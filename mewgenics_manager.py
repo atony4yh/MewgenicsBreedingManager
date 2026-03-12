@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
-    QFileSystemWatcher, QItemSelectionModel, QSize, Signal, QRegularExpression,
+    QFileSystemWatcher, QItemSelectionModel, QSize, Signal, QRegularExpression, QTimer,
 )
 from PySide6.QtGui import (
     QColor, QBrush, QAction, QPalette, QFont, QKeySequence, QFontMetrics,
@@ -790,8 +790,8 @@ def _is_exceptional_breeder(cat: "Cat") -> bool:
     return _cat_base_sum(cat) >= EXCEPTIONAL_SUM_THRESHOLD
 
 
-def _donation_candidate_reason(cat: "Cat") -> Optional[str]:
-    if _is_exceptional_breeder(cat) or cat.must_breed:
+def _donation_candidate_base_reason(cat: "Cat") -> Optional[str]:
+    if _is_exceptional_breeder(cat):
         return None
     total = _cat_base_sum(cat)
     top_stat = max(cat.base_stats.values()) if cat.base_stats else 0
@@ -810,8 +810,17 @@ def _donation_candidate_reason(cat: "Cat") -> Optional[str]:
     return ", ".join(reasons)
 
 
+def _donation_candidate_reason(cat: "Cat") -> Optional[str]:
+    base_reason = _donation_candidate_base_reason(cat)
+    if base_reason is None:
+        return None
+    if cat.must_breed:
+        return f"{base_reason} (currently marked Must Breed)"
+    return base_reason
+
+
 def _is_donation_candidate(cat: "Cat") -> bool:
-    return _donation_candidate_reason(cat) is not None
+    return _donation_candidate_base_reason(cat) is not None
 
 
 def _pair_breakpoint_analysis(a: "Cat", b: "Cat", stimulation: float = 50.0) -> dict:
@@ -2656,17 +2665,25 @@ class CatTableModel(QAbstractTableModel):
             return False
         cat = self._cats[index.row()]
         new_state = (value == Qt.Checked)
+        changed_indexes = [index]
 
         if col == COL_BL:
             if cat.is_blacklisted == new_state:
                 return False
             cat.is_blacklisted = new_state
+            if new_state and cat.must_breed:
+                cat.must_breed = False
+                changed_indexes.append(self.index(index.row(), COL_MB))
         elif col == COL_MB:
             if cat.must_breed == new_state:
                 return False
             cat.must_breed = new_state
+            if new_state and cat.is_blacklisted:
+                cat.is_blacklisted = False
+                changed_indexes.append(self.index(index.row(), COL_BL))
 
-        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+        for changed_index in changed_indexes:
+            self.dataChanged.emit(changed_index, changed_index, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
         self.blacklistChanged.emit()
         return True
 
@@ -2983,13 +3000,18 @@ class CatDetailPanel(QWidget):
             "QPushButton:hover { background:#131328; color:#ddd; }")
         def _toggle_blacklist():
             cat.is_blacklisted = not cat.is_blacklisted
+            if cat.is_blacklisted:
+                cat.must_breed = False
             blacklist_btn.setText("✓ Include in Breeding" if not cat.is_blacklisted else "✗ Exclude from Breeding")
+            must_breed_btn.setText("★ Must Breed" if cat.must_breed else "☆ Normal Priority")
             mw = self.window()
             if hasattr(mw, "_source_model") and mw._source_model is not None:
                 for row in range(mw._source_model.rowCount()):
                     if mw._source_model.cat_at(row) is cat:
-                        idx = mw._source_model.index(row, COL_BL)
-                        mw._source_model.dataChanged.emit(idx, idx, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        idx_bl = mw._source_model.index(row, COL_BL)
+                        idx_mb = mw._source_model.index(row, COL_MB)
+                        mw._source_model.dataChanged.emit(idx_bl, idx_bl, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        mw._source_model.dataChanged.emit(idx_mb, idx_mb, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
                         # Emit blacklistChanged which will trigger _on_blacklist_changed
                         mw._source_model.blacklistChanged.emit()
                         break
@@ -3004,13 +3026,18 @@ class CatDetailPanel(QWidget):
             "QPushButton:hover { background:#131328; color:#ddd; }")
         def _toggle_must_breed():
             cat.must_breed = not cat.must_breed
+            if cat.must_breed:
+                cat.is_blacklisted = False
             must_breed_btn.setText("★ Must Breed" if cat.must_breed else "☆ Normal Priority")
+            blacklist_btn.setText("✓ Include in Breeding" if not cat.is_blacklisted else "✗ Exclude from Breeding")
             mw = self.window()
             if hasattr(mw, "_source_model") and mw._source_model is not None:
                 for row in range(mw._source_model.rowCount()):
                     if mw._source_model.cat_at(row) is cat:
-                        idx = mw._source_model.index(row, COL_MB)
-                        mw._source_model.dataChanged.emit(idx, idx, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        idx_bl = mw._source_model.index(row, COL_BL)
+                        idx_mb = mw._source_model.index(row, COL_MB)
+                        mw._source_model.dataChanged.emit(idx_bl, idx_bl, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
+                        mw._source_model.dataChanged.emit(idx_mb, idx_mb, [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole])
                         # Emit blacklistChanged to save must_breed state
                         mw._source_model.blacklistChanged.emit()
                         break
@@ -3159,7 +3186,8 @@ class CatDetailPanel(QWidget):
             data["pair_stimulation"] = self._pair_stimulation
             _save_app_config(data)
             if len(self._current_cats) >= 2:
-                self.show_cats(self._current_cats[:2])
+                current_pair = list(self._current_cats[:2])
+                QTimer.singleShot(0, lambda pair=current_pair: self.show_cats(pair))
         stim_box.valueChanged.connect(_set_pair_stimulation)
         hdr.addWidget(stim_box)
         if not ok:
@@ -3390,9 +3418,13 @@ class CatDetailPanel(QWidget):
 
         root.addLayout(inh)
 
-        bp = QVBoxLayout()
-        bp.setSpacing(6)
-        bp.addWidget(_sec("BREAKPOINT HINTS"))
+        # ── Breakpoints + appearance + lineage ─────────────────────────────
+        bot = QHBoxLayout()
+        bot.setSpacing(20)
+
+        bp_col = QVBoxLayout()
+        bp_col.setSpacing(6)
+        bp_col.addWidget(_sec("BREAKPOINT HINTS"))
         bp_note = QLabel(
             f"{breakpoint_info['headline']}  |  "
             f"Sum range {breakpoint_info['sum_range'][0]}-{breakpoint_info['sum_range'][1]}  |  "
@@ -3400,50 +3432,71 @@ class CatDetailPanel(QWidget):
         )
         bp_note.setStyleSheet(_DETAIL_TEXT_STYLE)
         bp_note.setWordWrap(True)
-        bp.addWidget(bp_note)
-        for hint in breakpoint_info["hints"]:
-            line = QLabel("• " + hint)
-            line.setStyleSheet(_DETAIL_TEXT_STYLE)
-            line.setWordWrap(True)
-            bp.addWidget(line)
+        bp_col.addWidget(bp_note)
 
-        bp_grid = QGridLayout()
-        bp_grid.setContentsMargins(0, 2, 0, 0)
-        bp_grid.setHorizontalSpacing(6)
-        bp_grid.setVerticalSpacing(3)
-        for col, title in enumerate(("Stat", "Range", "Expected", "Breakpoint")):
-            hdr = QLabel(title)
-            hdr.setStyleSheet("color:#666; font-size:10px; font-weight:bold;")
-            hdr.setAlignment(Qt.AlignCenter if col else Qt.AlignLeft)
-            bp_grid.addWidget(hdr, 0, col)
-        for row_idx, row in enumerate(breakpoint_info["rows"], 1):
+        bp_table = QTableWidget(4, len(STAT_NAMES))
+        bp_table.setHorizontalHeaderLabels(STAT_NAMES)
+        bp_table.setVerticalHeaderLabels(["Range", "Exp", "Breakpoint", "Hint"])
+        bp_table.setSelectionMode(QAbstractItemView.NoSelection)
+        bp_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        bp_table.setFocusPolicy(Qt.NoFocus)
+        bp_table.setWordWrap(False)
+        bp_table.setStyleSheet("""
+            QTableWidget {
+                background:#0d0d1c; alternate-background-color:#131326;
+                color:#ddd; border:1px solid #26264a; font-size:11px;
+            }
+            QTableWidget::item { padding:2px 4px; }
+            QHeaderView::section {
+                background:#16213e; color:#888; padding:4px 3px;
+                border:none; border-bottom:1px solid #1e1e38;
+                border-right:1px solid #16213e; font-size:10px; font-weight:bold;
+            }
+        """)
+        bp_hh = bp_table.horizontalHeader()
+        for col in range(len(STAT_NAMES)):
+            bp_hh.setSectionResizeMode(col, QHeaderView.Stretch)
+        bp_vh = bp_table.verticalHeader()
+        for row in range(4):
+            bp_vh.setSectionResizeMode(row, QHeaderView.ResizeToContents)
+        for col_idx, row in enumerate(breakpoint_info["rows"]):
             status_color = {
                 "locked": QColor(98, 194, 135),
                 "can hit 7": QColor(143, 201, 230),
                 "one step off": QColor(216, 181, 106),
                 "stalled": QColor(190, 145, 40),
             }.get(row["status"], QColor(120, 120, 135))
-            stat_lbl = QLabel(row["stat"])
-            range_lbl = QLabel(f"{row['lo']}-{row['hi']}" if row["lo"] != row["hi"] else str(row["lo"]))
-            exp_lbl = QLabel(f"{row['expected']:.1f}")
-            status_lbl = QLabel(row["status"])
-            for lbl in (range_lbl, exp_lbl, status_lbl):
-                lbl.setAlignment(Qt.AlignCenter)
-                lbl.setStyleSheet(
-                    f"color:rgb({status_color.red()},{status_color.green()},{status_color.blue()}); font-size:10px;"
-                )
-            stat_lbl.setStyleSheet("color:#ddd; font-size:10px;")
-            bp_grid.addWidget(stat_lbl, row_idx, 0)
-            bp_grid.addWidget(range_lbl, row_idx, 1)
-            bp_grid.addWidget(exp_lbl, row_idx, 2)
-            bp_grid.addWidget(status_lbl, row_idx, 3)
-        bp.addLayout(bp_grid)
-
-        root.addLayout(bp)
-
-        # ── Appearance preview + lineage ───────────────────────────────────
-        bot = QHBoxLayout()
-        bot.setSpacing(20)
+            range_item = QTableWidgetItem(f"{row['lo']}-{row['hi']}" if row["lo"] != row["hi"] else str(row["lo"]))
+            exp_item = QTableWidgetItem(f"{row['expected']:.1f}")
+            status_item = QTableWidgetItem(row["status"])
+            hint_text = (
+                "lock" if row["status"] == "locked"
+                else "7 now" if row["status"] == "can hit 7"
+                else "next up" if row["status"] == "one step off"
+                else "needs help"
+            )
+            hint_item = QTableWidgetItem(hint_text)
+            for item in (range_item, exp_item, status_item, hint_item):
+                item.setForeground(QBrush(status_color))
+                item.setTextAlignment(Qt.AlignCenter)
+            bp_table.setItem(0, col_idx, range_item)
+            bp_table.setItem(1, col_idx, exp_item)
+            bp_table.setItem(2, col_idx, status_item)
+            bp_table.setItem(3, col_idx, hint_item)
+        bp_table.resizeRowsToContents()
+        bp_height = bp_table.horizontalHeader().height() + 4
+        for row in range(bp_table.rowCount()):
+            bp_height += bp_table.rowHeight(row)
+        bp_height += 4
+        bp_table.setFixedHeight(bp_height)
+        bp_col.addWidget(bp_table)
+        if breakpoint_info["hints"]:
+            hints_lbl = QLabel("  |  ".join(breakpoint_info["hints"][:2]))
+            hints_lbl.setStyleSheet(_META_STYLE)
+            hints_lbl.setWordWrap(True)
+            bp_col.addWidget(hints_lbl)
+        bot.addLayout(bp_col, 2)
+        bot.addWidget(_vsep())
 
         app_col = QVBoxLayout()
         app_col.setSpacing(6)
@@ -3484,7 +3537,7 @@ class CatDetailPanel(QWidget):
             app_col.addWidget(QLabel("No distinct parent appearance data detected.", styleSheet=_META_STYLE))
 
         app_col.addStretch()
-        bot.addLayout(app_col)
+        bot.addLayout(app_col, 1)
         if self._show_lineage:
             bot.addWidget(_vsep())
 
@@ -4326,8 +4379,16 @@ class RoomOptimizerView(QWidget):
         root.addLayout(header)
 
         # Controls
-        controls = QHBoxLayout()
+        controls_wrap = QScrollArea()
+        controls_wrap.setWidgetResizable(True)
+        controls_wrap.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls_wrap.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_wrap.setFrameShape(QFrame.NoFrame)
+        controls_wrap.setStyleSheet("QScrollArea { border:none; background:transparent; }")
+        controls_box = QWidget()
+        controls = QHBoxLayout(controls_box)
         controls.setSpacing(8)
+        controls.setContentsMargins(0, 0, 0, 0)
 
         self._min_stats_label = QLabel("Min base stats:")
         self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
@@ -4358,6 +4419,18 @@ class RoomOptimizerView(QWidget):
         controls.addWidget(self._max_risk_input)
 
         controls.addSpacing(16)
+
+        self._optimize_btn = QPushButton("Calculate Optimal Distribution")
+        self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
+        self._optimize_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+            "QPushButton:pressed { background:#184b3a; }"
+        )
+        controls.addWidget(self._optimize_btn)
+
+        controls.addSpacing(8)
 
         self._mode_toggle_btn = QPushButton("Mode: Pair Quality")
         self._mode_toggle_btn.setCheckable(True)
@@ -4435,23 +4508,9 @@ class RoomOptimizerView(QWidget):
         self._bind_persistent_toggle(self._prefer_high_libido_checkbox, "Prefer High Libido", "prefer_high_libido")
         controls.addWidget(self._prefer_high_libido_checkbox)
 
-        self._optimize_btn = QPushButton("Calculate Optimal Distribution")
-        self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
-        self._optimize_btn.setStyleSheet(
-            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
-            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
-            "QPushButton:hover { background:#26735a; }"
-            "QPushButton:pressed { background:#184b3a; }"
-        )
-        controls.addWidget(self._optimize_btn)
-
         controls.addStretch()
-        root.addLayout(controls)
-
-        self._blacklist_lbl = QLabel("")
-        self._blacklist_lbl.setWordWrap(True)
-        self._blacklist_lbl.setStyleSheet("color:#8d8da8; font-size:11px;")
-        root.addWidget(self._blacklist_lbl)
+        controls_wrap.setWidget(controls_box)
+        root.addWidget(controls_wrap)
 
         # Splitter to hold table and details pane
         self._splitter = QSplitter(Qt.Vertical)
@@ -4528,11 +4587,6 @@ class RoomOptimizerView(QWidget):
             self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
         else:
             self._summary.setText(f"{alive_count} alive cats available")
-        blacklisted_names = [f"{c.name} ({c.gender_display})" for c in cats if c.status != "Gone" and c.is_blacklisted]
-        if blacklisted_names:
-            self._blacklist_lbl.setText("Blacklisted: " + ", ".join(blacklisted_names))
-        else:
-            self._blacklist_lbl.setText("Blacklisted: none")
 
     def _calculate_optimal_distribution(self):
         """Calculate and display optimal room distribution."""
@@ -5098,10 +5152,23 @@ class RoomOptimizerView(QWidget):
                 "avg_stats": 0.0,
                 "avg_risk": 0.0,
                 "excluded_cats": excluded_names,
+                "excluded_cat_rows": [
+                    {
+                        "name": f"{cat.name} ({cat.gender_display})",
+                        "stats": dict(cat.base_stats),
+                        "sum": _cat_base_sum(cat),
+                        "traits": {
+                            "aggression": _trait_label_from_value("aggression", cat.aggression) or "unknown",
+                            "libido": _trait_label_from_value("libido", cat.libido) or "unknown",
+                            "inbredness": _trait_label_from_value("inbredness", cat.inbredness) or "unknown",
+                        },
+                    }
+                    for cat in excluded_cats
+                ],
                 "pairs": [],
             })
 
-            excluded_cats_item = QTableWidgetItem(", ".join(excluded_names))
+            excluded_cats_item = QTableWidgetItem(f"{len(excluded_cats)} excluded cats")
             dash_item_2 = QTableWidgetItem("—"); dash_item_2.setTextAlignment(Qt.AlignCenter)
             dash_item_3 = QTableWidgetItem("—"); dash_item_3.setTextAlignment(Qt.AlignCenter)
             dash_item_4 = QTableWidgetItem("—"); dash_item_4.setTextAlignment(Qt.AlignCenter)
@@ -5185,6 +5252,39 @@ class RoomOptimizerDetailPanel(QWidget):
         """)
         root.addWidget(self._pairs_table, 1)
 
+        self._excluded_table = QTableWidget(0, 12)
+        self._excluded_table.setHorizontalHeaderLabels([
+            "Cat", "STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK", "Sum", "Agg", "Lib", "Inbred"
+        ])
+        self._excluded_table.verticalHeader().setVisible(False)
+        self._excluded_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._excluded_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._excluded_table.setFocusPolicy(Qt.NoFocus)
+        self._excluded_table.setAlternatingRowColors(True)
+        self._excluded_table.hide()
+        ex_hh = self._excluded_table.horizontalHeader()
+        ex_hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 9):
+            ex_hh.setSectionResizeMode(col, QHeaderView.Fixed)
+        for col in range(1, 8):
+            self._excluded_table.setColumnWidth(col, 50)
+        self._excluded_table.setColumnWidth(8, 60)
+        for col in range(9, 12):
+            self._excluded_table.setColumnWidth(col, 60)
+        self._excluded_table.setStyleSheet("""
+            QTableWidget {
+                background:#0d0d1c; alternate-background-color:#131326;
+                color:#ddd; border:1px solid #26264a; font-size:12px;
+            }
+            QTableWidget::item { padding:3px 4px; }
+            QHeaderView::section {
+                background:#16213e; color:#888; padding:5px 4px;
+                border:none; border-bottom:1px solid #1e1e38;
+                border-right:1px solid #16213e; font-size:11px; font-weight:bold;
+            }
+        """)
+        root.addWidget(self._excluded_table, 1)
+
     @staticmethod
     def _range_background(lo: int, hi: int) -> QColor:
         base = STAT_COLORS.get(max(lo, hi), QColor(100, 100, 115))
@@ -5205,6 +5305,8 @@ class RoomOptimizerDetailPanel(QWidget):
             self._summary.setText("Select a room to see pair details.")
             self._summary.setToolTip("")
             self._pairs_table.setRowCount(0)
+            self._pairs_table.show()
+            self._excluded_table.hide()
             return
 
         room = data.get("room", "Unknown")
@@ -5214,6 +5316,37 @@ class RoomOptimizerDetailPanel(QWidget):
         avg_risk = float(data.get("avg_risk", 0))
         pairs = data.get("pairs", [])
         excluded_cats = data.get("excluded_cats", [])
+        excluded_cat_rows = data.get("excluded_cat_rows", [])
+
+        if room == "Excluded":
+            self._pairs_table.hide()
+            self._excluded_table.show()
+            self._summary.setText(f"Excluded Cats  |  {len(excluded_cat_rows)} cats excluded from breeding calculations")
+            self._summary.setToolTip("Excluded cats are hidden from room optimizer breeding calculations.")
+            self._excluded_table.setRowCount(len(excluded_cat_rows))
+            for row_idx, cat_row in enumerate(excluded_cat_rows):
+                name_item = QTableWidgetItem(cat_row["name"])
+                self._excluded_table.setItem(row_idx, 0, name_item)
+                for stat_col, stat in enumerate(STAT_NAMES, start=1):
+                    value = int(cat_row["stats"].get(stat, 0))
+                    item = QTableWidgetItem(str(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setBackground(QBrush(STAT_COLORS.get(value, QColor(100, 100, 115))))
+                    self._excluded_table.setItem(row_idx, stat_col, item)
+                sum_item = QTableWidgetItem(str(int(cat_row["sum"])))
+                sum_item.setTextAlignment(Qt.AlignCenter)
+                self._excluded_table.setItem(row_idx, 8, sum_item)
+                for trait_col, trait_key in enumerate(("aggression", "libido", "inbredness"), start=9):
+                    trait_text = cat_row["traits"][trait_key]
+                    trait_display = trait_text.replace("average", "avg")
+                    trait_item = QTableWidgetItem(trait_display)
+                    trait_item.setTextAlignment(Qt.AlignCenter)
+                    trait_item.setBackground(QBrush(_trait_level_color(trait_text)))
+                    self._excluded_table.setItem(row_idx, trait_col, trait_item)
+            return
+
+        self._pairs_table.show()
+        self._excluded_table.hide()
 
         def _compact_names(names: list[str], limit: int = 8) -> str:
             if len(names) <= limit:
@@ -5326,6 +5459,39 @@ class PerfectPlannerDetailPanel(QWidget):
         """)
         root.addWidget(self._actions_table, 1)
 
+        self._excluded_table = QTableWidget(0, 12)
+        self._excluded_table.setHorizontalHeaderLabels([
+            "Cat", "STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK", "Sum", "Agg", "Lib", "Inbred"
+        ])
+        self._excluded_table.verticalHeader().setVisible(False)
+        self._excluded_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._excluded_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._excluded_table.setFocusPolicy(Qt.NoFocus)
+        self._excluded_table.setAlternatingRowColors(True)
+        self._excluded_table.hide()
+        ex_hh = self._excluded_table.horizontalHeader()
+        ex_hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 9):
+            ex_hh.setSectionResizeMode(col, QHeaderView.Fixed)
+        for col in range(1, 8):
+            self._excluded_table.setColumnWidth(col, 50)
+        self._excluded_table.setColumnWidth(8, 60)
+        for col in range(9, 12):
+            self._excluded_table.setColumnWidth(col, 60)
+        self._excluded_table.setStyleSheet("""
+            QTableWidget {
+                background:#0d0d1c; alternate-background-color:#131326;
+                color:#ddd; border:1px solid #26264a; font-size:12px;
+            }
+            QTableWidget::item { padding:3px 4px; }
+            QHeaderView::section {
+                background:#16213e; color:#888; padding:5px 4px;
+                border:none; border-bottom:1px solid #1e1e38;
+                border-right:1px solid #16213e; font-size:11px; font-weight:bold;
+            }
+        """)
+        root.addWidget(self._excluded_table, 1)
+
     @staticmethod
     def _build_target_grid(action: dict) -> QWidget:
         container = QWidget()
@@ -5414,7 +5580,40 @@ class PerfectPlannerDetailPanel(QWidget):
             self._summary.setText("Select a stage to see the plan details.")
             self._summary.setToolTip("")
             self._actions_table.setRowCount(0)
+            self._actions_table.show()
+            self._excluded_table.hide()
             return
+
+        if data.get("stage") == "Excluded":
+            rows = data.get("excluded_cat_rows", [])
+            self._summary.setText(f"Excluded Cats  |  {len(rows)} cats excluded from planner calculations")
+            self._summary.setToolTip("Excluded cats are hidden from the Perfect 7 Planner calculations.")
+            self._actions_table.hide()
+            self._excluded_table.show()
+            self._excluded_table.setRowCount(len(rows))
+            for row_idx, cat_row in enumerate(rows):
+                name_item = QTableWidgetItem(cat_row["name"])
+                self._excluded_table.setItem(row_idx, 0, name_item)
+                for stat_col, stat in enumerate(STAT_NAMES, start=1):
+                    value = int(cat_row["stats"].get(stat, 0))
+                    item = QTableWidgetItem(str(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setBackground(QBrush(STAT_COLORS.get(value, QColor(100, 100, 115))))
+                    self._excluded_table.setItem(row_idx, stat_col, item)
+                sum_item = QTableWidgetItem(str(int(cat_row["sum"])))
+                sum_item.setTextAlignment(Qt.AlignCenter)
+                self._excluded_table.setItem(row_idx, 8, sum_item)
+                for trait_col, trait_key in enumerate(("aggression", "libido", "inbredness"), start=9):
+                    trait_text = cat_row["traits"][trait_key]
+                    trait_display = trait_text.replace("average", "avg")
+                    trait_item = QTableWidgetItem(trait_display)
+                    trait_item.setTextAlignment(Qt.AlignCenter)
+                    trait_item.setBackground(QBrush(_trait_level_color(trait_text)))
+                    self._excluded_table.setItem(row_idx, trait_col, trait_item)
+            return
+
+        self._actions_table.show()
+        self._excluded_table.hide()
 
         self._summary.setText(data.get("summary", ""))
         notes = data.get("notes", [])
@@ -5505,8 +5704,16 @@ class PerfectCatPlannerView(QWidget):
         desc.setStyleSheet("color:#8d8da8; font-size:11px;")
         root.addWidget(desc)
 
-        controls = QHBoxLayout()
+        controls_wrap = QScrollArea()
+        controls_wrap.setWidgetResizable(True)
+        controls_wrap.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls_wrap.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_wrap.setFrameShape(QFrame.NoFrame)
+        controls_wrap.setStyleSheet("QScrollArea { border:none; background:transparent; }")
+        controls_box = QWidget()
+        controls = QHBoxLayout(controls_box)
         controls.setSpacing(8)
+        controls.setContentsMargins(0, 0, 0, 0)
 
         self._min_stats_label = QLabel("Min base stats:")
         self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
@@ -5566,6 +5773,18 @@ class PerfectCatPlannerView(QWidget):
 
         controls.addSpacing(12)
 
+        self._plan_btn = QPushButton("Build Perfect 7 Plan")
+        self._plan_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+            "QPushButton:pressed { background:#184b3a; }"
+        )
+        self._plan_btn.clicked.connect(self._calculate_plan)
+        controls.addWidget(self._plan_btn)
+
+        controls.addSpacing(12)
+
         self._avoid_lovers_checkbox = QPushButton()
         self._avoid_lovers_checkbox.setCheckable(True)
         self._avoid_lovers_checkbox.setChecked(_saved_optimizer_flag("perfect_planner_avoid_lovers", False))
@@ -5610,23 +5829,9 @@ class PerfectCatPlannerView(QWidget):
         )
         controls.addWidget(self._prefer_high_libido_checkbox)
 
-        self._plan_btn = QPushButton("Build Perfect 7 Plan")
-        self._plan_btn.setStyleSheet(
-            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
-            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
-            "QPushButton:hover { background:#26735a; }"
-            "QPushButton:pressed { background:#184b3a; }"
-        )
-        self._plan_btn.clicked.connect(self._calculate_plan)
-        controls.addWidget(self._plan_btn)
-
         controls.addStretch()
-        root.addLayout(controls)
-
-        self._blacklist_lbl = QLabel("")
-        self._blacklist_lbl.setWordWrap(True)
-        self._blacklist_lbl.setStyleSheet("color:#8d8da8; font-size:11px;")
-        root.addWidget(self._blacklist_lbl)
+        controls_wrap.setWidget(controls_box)
+        root.addWidget(controls_wrap)
 
         self._splitter = QSplitter(Qt.Vertical)
         self._splitter.setStyleSheet("QSplitter::handle:vertical { background:#1e1e38; }")
@@ -5681,8 +5886,6 @@ class PerfectCatPlannerView(QWidget):
             self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
         else:
             self._summary.setText(f"{alive_count} alive cats available")
-        blacklisted_names = [f"{c.name} ({c.gender_display})" for c in cats if c.status != "Gone" and c.is_blacklisted]
-        self._blacklist_lbl.setText("Blacklisted: " + (", ".join(blacklisted_names) if blacklisted_names else "none"))
 
     def _calculate_plan(self):
         excluded_keys = getattr(self, "_excluded_keys", set())
@@ -6259,6 +6462,39 @@ class PerfectCatPlannerView(QWidget):
             self._table.setItem(row_idx, 5, details_item)
 
         if excluded_cats:
+            row_idx = self._table.rowCount()
+            self._table.insertRow(row_idx)
+            stage_item = QTableWidgetItem("Excluded")
+            stage_item.setTextAlignment(Qt.AlignCenter)
+            stage_item.setForeground(QBrush(QColor(170, 120, 120)))
+            stage_item.setData(Qt.UserRole, {
+                "stage": "Excluded",
+                "excluded_cat_rows": [
+                    {
+                        "name": f"{cat.name} ({cat.gender_display})",
+                        "stats": dict(cat.base_stats),
+                        "sum": _cat_base_sum(cat),
+                        "traits": {
+                            "aggression": _trait_label_from_value("aggression", cat.aggression) or "unknown",
+                            "libido": _trait_label_from_value("libido", cat.libido) or "unknown",
+                            "inbredness": _trait_label_from_value("inbredness", cat.inbredness) or "unknown",
+                        },
+                    }
+                    for cat in excluded_cats
+                ],
+            })
+            details_item = QTableWidgetItem("Excluded from Perfect 7 Planner calculations")
+            dash_pair = QTableWidgetItem("—"); dash_pair.setTextAlignment(Qt.AlignCenter)
+            dash_cov = QTableWidgetItem("—"); dash_cov.setTextAlignment(Qt.AlignCenter)
+            dash_risk = QTableWidgetItem("—"); dash_risk.setTextAlignment(Qt.AlignCenter)
+            self._table.setItem(row_idx, 0, stage_item)
+            self._table.setItem(row_idx, 1, QTableWidgetItem(f"{len(excluded_cats)} excluded cats"))
+            self._table.setItem(row_idx, 2, dash_pair)
+            self._table.setItem(row_idx, 3, dash_cov)
+            self._table.setItem(row_idx, 4, dash_risk)
+            self._table.setItem(row_idx, 5, details_item)
+
+        if excluded_cats:
             self._summary.setText(
                 f"Planned {len(selected_pairs)} starting pairs from {len(alive_cats)} eligible cats "
                 f"({len(excluded_cats)} excluded)"
@@ -6697,6 +6933,10 @@ def _sidebar_btn(label: str) -> QPushButton:
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    @staticmethod
+    def _set_bulk_toggle_label(btn: QPushButton, label: str, enabled: bool):
+        btn.setText(f"{label}: {'On' if enabled else 'Off'}")
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Mewgenics Breeding Manager")
@@ -7097,6 +7337,35 @@ class MainWindow(QMainWindow):
         self._count_lbl.setStyleSheet("color:#555; font-size:12px; padding-left:8px;")
         self._summary_lbl = QLabel("")
         self._summary_lbl.setStyleSheet("color:#4a7a9a; font-size:11px;")
+        self._bulk_actions_layout = QHBoxLayout()
+        self._bulk_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self._bulk_actions_layout.setSpacing(8)
+        self._bulk_blacklist_btn = QPushButton()
+        self._bulk_blacklist_btn.hide()
+        self._bulk_blacklist_btn.setCheckable(True)
+        self._bulk_blacklist_btn.setStyleSheet(
+            "QPushButton { background:#5a2d22; color:#f1dfda; border:1px solid #8b4c3e;"
+            " border-radius:4px; padding:4px 10px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#6c382a; }"
+            "QPushButton:pressed { background:#4c241b; }"
+            "QPushButton:checked { background:#7a3626; border:1px solid #b35b48; }"
+        )
+        self._set_bulk_toggle_label(self._bulk_blacklist_btn, "Breeding Block", False)
+        self._bulk_blacklist_btn.clicked.connect(self._toggle_blacklist_filtered_cats)
+        self._bulk_must_breed_btn = QPushButton()
+        self._bulk_must_breed_btn.hide()
+        self._bulk_must_breed_btn.setCheckable(True)
+        self._bulk_must_breed_btn.setStyleSheet(
+            "QPushButton { background:#3b355f; color:#ece8fb; border:1px solid #5d58a0;"
+            " border-radius:4px; padding:4px 10px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#49417a; }"
+            "QPushButton:pressed { background:#312c4f; }"
+            "QPushButton:checked { background:#514890; border:1px solid #7d73c7; }"
+        )
+        self._set_bulk_toggle_label(self._bulk_must_breed_btn, "Must Breed", False)
+        self._bulk_must_breed_btn.clicked.connect(self._toggle_must_breed_filtered_cats)
+        self._bulk_actions_layout.addWidget(self._bulk_must_breed_btn)
+        self._bulk_actions_layout.addWidget(self._bulk_blacklist_btn)
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search cats, abilities, mutations…")
         self._search.setClearButtonEnabled(True)
@@ -7108,6 +7377,8 @@ class MainWindow(QMainWindow):
         hb.addWidget(self._header_lbl)
         hb.addWidget(self._count_lbl)
         hb.addStretch()
+        hb.addLayout(self._bulk_actions_layout)
+        hb.addSpacing(10)
         hb.addWidget(self._search)
         hb.addSpacing(12)
         hb.addWidget(self._summary_lbl)
@@ -7216,6 +7487,7 @@ class MainWindow(QMainWindow):
         self._table.clicked.connect(self._on_table_clicked)
         self._search.textChanged.connect(self._proxy_model.set_name_filter)
         self._search.textChanged.connect(self._update_count)
+        self._search.textChanged.connect(lambda _: self._refresh_bulk_view_buttons())
         vs.addWidget(self._table)
 
         # Detail panel
@@ -7293,10 +7565,211 @@ class MainWindow(QMainWindow):
         btn.setChecked(True)
         self._active_btn = btn
         self._proxy_model.set_room(room_key)
+        self._refresh_bulk_view_buttons(room_key)
         self._update_header(room_key)
         self._update_count()
         self._detail.show_cats([])
         self._source_model.set_focus_cat(None)
+
+    def _visible_filtered_cats(self) -> list[Cat]:
+        cats: list[Cat] = []
+        for row in range(self._proxy_model.rowCount()):
+            src_idx = self._proxy_model.mapToSource(self._proxy_model.index(row, 0))
+            if not src_idx.isValid():
+                continue
+            cat = self._source_model.cat_at(src_idx.row())
+            if cat is not None:
+                cats.append(cat)
+        return cats
+
+    def _refresh_bulk_view_buttons(self, room_key=None):
+        if room_key is None and self._active_btn is not None:
+            for key, btn in self._room_btns.items():
+                if btn is self._active_btn:
+                    room_key = key
+                    break
+        visible = room_key in ("__donation__", "__exceptional__")
+        donation_view = room_key == "__donation__"
+        exceptional_view = room_key == "__exceptional__"
+        if hasattr(self, "_bulk_actions_layout"):
+            while self._bulk_actions_layout.count():
+                item = self._bulk_actions_layout.takeAt(0)
+                if item.widget():
+                    item.widget().setParent(None)
+            if donation_view:
+                self._bulk_actions_layout.addWidget(self._bulk_blacklist_btn)
+                self._bulk_actions_layout.addWidget(self._bulk_must_breed_btn)
+            else:
+                self._bulk_actions_layout.addWidget(self._bulk_must_breed_btn)
+                self._bulk_actions_layout.addWidget(self._bulk_blacklist_btn)
+        if hasattr(self, "_bulk_blacklist_btn"):
+            self._bulk_blacklist_btn.setVisible(visible)
+        if hasattr(self, "_bulk_must_breed_btn"):
+            self._bulk_must_breed_btn.setVisible(visible)
+        if not visible:
+            return
+        cats = self._visible_filtered_cats()
+        all_blocked = bool(cats) and all(cat.is_blacklisted for cat in cats)
+        all_must_breed = bool(cats) and all(cat.must_breed for cat in cats)
+        self._bulk_blacklist_btn.blockSignals(True)
+        if exceptional_view:
+            any_blocked = any(cat.is_blacklisted for cat in cats)
+            self._bulk_blacklist_btn.setChecked(False)
+            self._bulk_blacklist_btn.setEnabled(any_blocked)
+            self._bulk_blacklist_btn.setText("Clear Breeding Block")
+            self._bulk_blacklist_btn.setToolTip(
+                "Exceptional view only clears breeding blocks so high-value cats stay in the exceptional filter."
+            )
+        else:
+            self._bulk_blacklist_btn.setChecked(all_blocked)
+            self._bulk_blacklist_btn.setEnabled(True)
+            self._set_bulk_toggle_label(self._bulk_blacklist_btn, "Breeding Block", all_blocked)
+            self._bulk_blacklist_btn.setToolTip("")
+        self._bulk_blacklist_btn.blockSignals(False)
+        self._bulk_must_breed_btn.blockSignals(True)
+        if donation_view:
+            any_must_breed = any(cat.must_breed for cat in cats)
+            self._bulk_must_breed_btn.setChecked(False)
+            self._bulk_must_breed_btn.setEnabled(any_must_breed)
+            self._bulk_must_breed_btn.setText("Clear Must Breed")
+            self._bulk_must_breed_btn.setToolTip(
+                "Donation view only clears Must Breed so those cats stay in the donation-candidate filter."
+            )
+        else:
+            self._bulk_must_breed_btn.setChecked(all_must_breed)
+            self._bulk_must_breed_btn.setEnabled(True)
+            self._set_bulk_toggle_label(self._bulk_must_breed_btn, "Must Breed", all_must_breed)
+            self._bulk_must_breed_btn.setToolTip("")
+        self._bulk_must_breed_btn.blockSignals(False)
+
+    def _toggle_blacklist_filtered_cats(self):
+        room_key = None
+        if self._active_btn is not None:
+            for key, btn in self._room_btns.items():
+                if btn is self._active_btn:
+                    room_key = key
+                    break
+        exceptional_view = room_key == "__exceptional__"
+        target_state = False if exceptional_view else self._bulk_blacklist_btn.isChecked()
+        changed = 0
+        for cat in self._visible_filtered_cats():
+            if cat.is_blacklisted == target_state and (not target_state or not cat.must_breed):
+                continue
+            cat.is_blacklisted = target_state
+            if target_state:
+                cat.must_breed = False
+            changed += 1
+        self._refresh_bulk_view_buttons()
+        if changed == 0:
+            self.statusBar().showMessage("No cats in view needed a breeding-block change")
+            return
+        self._emit_bulk_toggle_refresh()
+        if exceptional_view:
+            self.statusBar().showMessage(f"Cleared breeding block for {changed} cats in the current exceptional view")
+        else:
+            state_text = "on" if target_state else "off"
+            self.statusBar().showMessage(f"Turned breeding block {state_text} for {changed} cats in the current view")
+
+    def _toggle_must_breed_filtered_cats(self):
+        room_key = None
+        if self._active_btn is not None:
+            for key, btn in self._room_btns.items():
+                if btn is self._active_btn:
+                    room_key = key
+                    break
+        donation_view = room_key == "__donation__"
+        target_state = False if donation_view else self._bulk_must_breed_btn.isChecked()
+        changed = 0
+        for cat in self._visible_filtered_cats():
+            if cat.must_breed == target_state and (not target_state or not cat.is_blacklisted):
+                continue
+            cat.must_breed = target_state
+            if target_state:
+                cat.is_blacklisted = False
+            changed += 1
+        self._refresh_bulk_view_buttons()
+        if changed == 0:
+            self.statusBar().showMessage("No cats in view needed a must-breed change")
+            return
+        self._emit_bulk_toggle_refresh()
+        if donation_view:
+            self.statusBar().showMessage(f"Cleared Must Breed for {changed} cats in the current donation-candidates view")
+        else:
+            state_text = "on" if target_state else "off"
+            self.statusBar().showMessage(f"Turned must breed {state_text} for {changed} cats in the current view")
+
+    def _emit_bulk_toggle_refresh(self):
+        if self._source_model.rowCount() == 0:
+            return
+        top_left = self._source_model.index(0, COL_BL)
+        bottom_right = self._source_model.index(max(0, self._source_model.rowCount() - 1), COL_MB)
+        self._source_model.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole],
+        )
+        self._proxy_model.invalidate()
+        self._source_model.blacklistChanged.emit()
+        self._update_count()
+        self._refresh_bulk_view_buttons()
+
+    def _blacklist_filtered_cats(self):
+        changed = 0
+        for row in range(self._proxy_model.rowCount()):
+            proxy_idx = self._proxy_model.index(row, COL_BL)
+            if not proxy_idx.isValid():
+                continue
+            src_idx = self._proxy_model.mapToSource(proxy_idx)
+            if not src_idx.isValid():
+                continue
+            cat = self._source_model.cat_at(src_idx.row())
+            if cat is None or cat.is_blacklisted:
+                continue
+            cat.is_blacklisted = True
+            changed += 1
+        if changed == 0:
+            self.statusBar().showMessage("No additional cats in view were added to the breeding blacklist")
+            return
+
+        top_left = self._source_model.index(0, COL_BL)
+        bottom_right = self._source_model.index(max(0, self._source_model.rowCount() - 1), COL_BL)
+        self._source_model.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole],
+        )
+        self._source_model.blacklistChanged.emit()
+        self._update_count()
+        self.statusBar().showMessage(f"Excluded {changed} cats in the current donation-candidates view from breeding")
+
+    def _clear_must_breed_filtered_cats(self):
+        changed = 0
+        for row in range(self._proxy_model.rowCount()):
+            proxy_idx = self._proxy_model.index(row, COL_MB)
+            if not proxy_idx.isValid():
+                continue
+            src_idx = self._proxy_model.mapToSource(proxy_idx)
+            if not src_idx.isValid():
+                continue
+            cat = self._source_model.cat_at(src_idx.row())
+            if cat is None or not cat.must_breed:
+                continue
+            cat.must_breed = False
+            changed += 1
+        if changed == 0:
+            self.statusBar().showMessage("No cats in view had Must Breed set")
+            return
+
+        top_left = self._source_model.index(0, COL_MB)
+        bottom_right = self._source_model.index(max(0, self._source_model.rowCount() - 1), COL_MB)
+        self._source_model.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [Qt.DisplayRole, Qt.CheckStateRole, Qt.ToolTipRole],
+        )
+        self._source_model.blacklistChanged.emit()
+        self._update_count()
+        self.statusBar().showMessage(f"Cleared Must Breed for {changed} cats in the current donation-candidates view")
 
     def _show_table_view(self):
         if hasattr(self, "_tree_view") and self._tree_view is not None:
@@ -7560,6 +8033,7 @@ class MainWindow(QMainWindow):
         if self._current_save:
             _save_blacklist(self._current_save, self._cats)
             _save_must_breed(self._current_save, self._cats)
+        self._refresh_bulk_view_buttons()
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
         if self._breeding_partners_view is not None:
