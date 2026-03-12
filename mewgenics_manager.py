@@ -119,6 +119,10 @@ ROOM_DISPLAY = {
     "Attic":          "Attic",
 }
 
+EXCEPTIONAL_SUM_THRESHOLD = 40
+DONATION_SUM_THRESHOLD = 34
+DONATION_MAX_TOP_STAT = 6
+
 # Full status → abbreviated display in table cell
 STATUS_ABBREV = {
     "In House":  "House",
@@ -776,6 +780,120 @@ def _relations_summary(cat: "Cat") -> str:
     if cat.haters:
         parts.append("H: " + ", ".join(other.name for other in cat.haters))
     return " | ".join(parts)
+
+
+def _cat_base_sum(cat: "Cat") -> int:
+    return int(sum(cat.base_stats.values()))
+
+
+def _is_exceptional_breeder(cat: "Cat") -> bool:
+    return _cat_base_sum(cat) >= EXCEPTIONAL_SUM_THRESHOLD
+
+
+def _donation_candidate_reason(cat: "Cat") -> Optional[str]:
+    if _is_exceptional_breeder(cat) or cat.must_breed:
+        return None
+    total = _cat_base_sum(cat)
+    top_stat = max(cat.base_stats.values()) if cat.base_stats else 0
+    reasons: list[str] = []
+    if total <= DONATION_SUM_THRESHOLD:
+        reasons.append(f"base sum {total} <= {DONATION_SUM_THRESHOLD}")
+    if top_stat <= DONATION_MAX_TOP_STAT:
+        reasons.append(f"top base stat {top_stat} <= {DONATION_MAX_TOP_STAT}")
+    aggression = cat.aggression
+    if aggression is not None and aggression >= 0.66:
+        reasons.append("high aggression")
+    if not reasons:
+        return None
+    if total > DONATION_SUM_THRESHOLD and top_stat > DONATION_MAX_TOP_STAT:
+        return None
+    return ", ".join(reasons)
+
+
+def _is_donation_candidate(cat: "Cat") -> bool:
+    return _donation_candidate_reason(cat) is not None
+
+
+def _pair_breakpoint_analysis(a: "Cat", b: "Cat", stimulation: float = 50.0) -> dict:
+    better_stat_chance = (1.0 + 0.01 * stimulation) / (2.0 + 0.01 * stimulation)
+    stat_rows: list[dict] = []
+    locks: list[str] = []
+    can_hit: list[str] = []
+    near_hit: list[str] = []
+    stalled: list[str] = []
+    upgrade_now: list[str] = []
+
+    for stat in STAT_NAMES:
+        va = int(a.base_stats[stat])
+        vb = int(b.base_stats[stat])
+        lo = min(va, vb)
+        hi = max(va, vb)
+        expected = hi * better_stat_chance + lo * (1.0 - better_stat_chance)
+        if lo >= 7:
+            status = "locked"
+            locks.append(stat)
+        elif hi >= 7:
+            status = "can hit 7"
+            can_hit.append(stat)
+        elif hi == 6:
+            status = "one step off"
+            near_hit.append(stat)
+        else:
+            status = "stalled"
+            stalled.append(stat)
+        if hi > lo:
+            upgrade_now.append(stat)
+        stat_rows.append({
+            "stat": stat,
+            "lo": lo,
+            "hi": hi,
+            "expected": expected,
+            "status": status,
+        })
+
+    if locks:
+        headline = f"Locks {', '.join(locks)}"
+    elif can_hit:
+        headline = f"Can hit 7 in {', '.join(can_hit)}"
+    elif near_hit:
+        headline = f"One step off in {', '.join(near_hit)}"
+    else:
+        headline = "No immediate 7 breakpoints"
+
+    hints: list[str] = []
+    if locks:
+        hints.append(f"This pair already guarantees 7s in {', '.join(locks)}.")
+    if can_hit:
+        hints.append(f"High-roll path to 7 exists in {', '.join(can_hit)}.")
+    if near_hit:
+        hints.append(
+            f"Next breakpoint is close in {', '.join(near_hit)}: bring in another 7 or keep the strongest kitten."
+        )
+    if stalled:
+        hints.append(
+            f"These stats are still below the next breakpoint: {', '.join(stalled)}."
+        )
+    if len(upgrade_now) >= 4:
+        hints.append("Good progression pair: multiple stats can improve immediately.")
+    elif len(upgrade_now) <= 1:
+        hints.append("Weak progression pair: very few stats can improve from the better parent.")
+
+    sum_lo = sum(row["lo"] for row in stat_rows)
+    sum_hi = sum(row["hi"] for row in stat_rows)
+    avg_expected = sum(row["expected"] for row in stat_rows) / len(STAT_NAMES)
+
+    return {
+        "headline": headline,
+        "hints": hints,
+        "locks": locks,
+        "can_hit": can_hit,
+        "near_hit": near_hit,
+        "stalled": stalled,
+        "rows": stat_rows,
+        "sum_range": (sum_lo, sum_hi),
+        "avg_expected": avg_expected,
+        "better_stat_chance": better_stat_chance,
+    }
 
 
 def _ability_effect_lines(cat: "Cat") -> list[str]:
@@ -2324,9 +2442,24 @@ class CatTableModel(QAbstractTableModel):
             return None
         cat = self._cats[index.row()]
         col = index.column()
+        is_exceptional = _is_exceptional_breeder(cat)
+        donation_reason = _donation_candidate_reason(cat)
+        is_donation = donation_reason is not None
+
+        def _badge_background() -> Optional[QColor]:
+            if is_exceptional:
+                return QColor(24, 78, 48)
+            if is_donation:
+                return QColor(82, 52, 22)
+            return None
 
         if role == Qt.DisplayRole:
-            if col == COL_NAME: return cat.name
+            if col == COL_NAME:
+                if is_exceptional:
+                    return f"[EXC] {cat.name}"
+                if is_donation:
+                    return f"[DON] {cat.name}"
+                return cat.name
             if col == COL_GEN:  return cat.gender_display
             if col == COL_ROOM: return cat.room_display
             if col == COL_STAT: return STATUS_ABBREV.get(cat.status, cat.status)
@@ -2366,6 +2499,8 @@ class CatTableModel(QAbstractTableModel):
                     return p.name if p.status != "Gone" else f"{p.name} (gone)"
                 return " × ".join(_pname(p) for p in (pa, pb) if p is not None)
         elif role == Qt.UserRole:
+            if col == COL_NAME:
+                return (cat.name or "").lower()
             if col in STAT_COLS:
                 return cat.base_stats[STAT_NAMES[col - STAT_COLS[0]]]
             if col == COL_SUM:
@@ -2413,6 +2548,14 @@ class CatTableModel(QAbstractTableModel):
                 if compat == 'risky':
                     return QBrush(QColor(base.red() // 2, base.green() // 2, base.blue() // 2))
                 return QBrush(base)
+            if col in (COL_NAME, COL_SUM):
+                badge = _badge_background()
+                if badge is not None:
+                    if compat == 'incompatible':
+                        badge = QColor(badge.red() // 4, badge.green() // 4, badge.blue() // 4)
+                    elif compat == 'risky':
+                        badge = QColor(badge.red() // 2, badge.green() // 2, badge.blue() // 2)
+                    return QBrush(badge)
             if compat == 'incompatible':
                 return QBrush(QColor(18, 12, 14))
             if compat == 'risky':
@@ -2427,10 +2570,21 @@ class CatTableModel(QAbstractTableModel):
                 return QBrush(QColor(65, 55, 60))
             if compat == 'risky':
                 return QBrush(QColor(130, 110, 60))
-            if col in STAT_COLS or col == COL_STAT or col in (COL_AGG, COL_LIB, COL_INBRD):
+            if col in STAT_COLS or col == COL_STAT or col in (COL_AGG, COL_LIB, COL_INBRD, COL_NAME, COL_SUM):
                 return QBrush(QColor(255, 255, 255))
 
         elif role == Qt.ToolTipRole:
+            if col == COL_NAME:
+                notes: list[str] = []
+                if is_exceptional:
+                    notes.append(
+                        f"Exceptional breeder: base stat sum {_cat_base_sum(cat)} >= {EXCEPTIONAL_SUM_THRESHOLD}"
+                    )
+                if donation_reason:
+                    notes.append(f"Donation candidate: {donation_reason}")
+                if notes:
+                    return "\n".join(notes)
+                return cat.name
             if col in STAT_COLS:
                 n = STAT_NAMES[col - STAT_COLS[0]]
                 b = cat.base_stats[n]
@@ -2466,6 +2620,13 @@ class CatTableModel(QAbstractTableModel):
                 if cat.inbredness is None:
                     return "Inbredness: unknown"
                 return f"Inbredness: {cat.inbredness:.3f} ({_trait_label_from_value('inbredness', cat.inbredness)})"
+            if col == COL_SUM:
+                notes: list[str] = [f"Base stat sum: {_cat_base_sum(cat)}"]
+                if is_exceptional:
+                    notes.append(f"Exceptional threshold: >= {EXCEPTIONAL_SUM_THRESHOLD}")
+                if donation_reason:
+                    notes.append(f"Donation signal: {donation_reason}")
+                return "\n".join(notes)
 
         elif role == Qt.CheckStateRole:
             if col == COL_BL:
@@ -2560,6 +2721,10 @@ class RoomFilterModel(QSortFilterProxyModel):
             return True
         if self._room is None:
             return cat.status != "Gone"
+        if self._room == "__exceptional__":
+            return cat.status != "Gone" and _is_exceptional_breeder(cat)
+        if self._room == "__donation__":
+            return cat.status != "Gone" and _is_donation_candidate(cat)
         if self._room == "__gone__":
             return cat.status == "Gone"
         if self._room == "__adventure__":
@@ -3196,6 +3361,7 @@ class CatDetailPanel(QWidget):
             stim,
             display_fn=_mutation_display_name,
         )
+        breakpoint_info = _pair_breakpoint_analysis(a, b, stim)
 
         inh = QVBoxLayout()
         inh.setSpacing(6)
@@ -3223,6 +3389,57 @@ class CatDetailPanel(QWidget):
             inh.addWidget(QLabel("No passive candidates.", styleSheet=_META_STYLE))
 
         root.addLayout(inh)
+
+        bp = QVBoxLayout()
+        bp.setSpacing(6)
+        bp.addWidget(_sec("BREAKPOINT HINTS"))
+        bp_note = QLabel(
+            f"{breakpoint_info['headline']}  |  "
+            f"Sum range {breakpoint_info['sum_range'][0]}-{breakpoint_info['sum_range'][1]}  |  "
+            f"Expected avg {breakpoint_info['avg_expected']:.1f}"
+        )
+        bp_note.setStyleSheet(_DETAIL_TEXT_STYLE)
+        bp_note.setWordWrap(True)
+        bp.addWidget(bp_note)
+        for hint in breakpoint_info["hints"]:
+            line = QLabel("• " + hint)
+            line.setStyleSheet(_DETAIL_TEXT_STYLE)
+            line.setWordWrap(True)
+            bp.addWidget(line)
+
+        bp_grid = QGridLayout()
+        bp_grid.setContentsMargins(0, 2, 0, 0)
+        bp_grid.setHorizontalSpacing(6)
+        bp_grid.setVerticalSpacing(3)
+        for col, title in enumerate(("Stat", "Range", "Expected", "Breakpoint")):
+            hdr = QLabel(title)
+            hdr.setStyleSheet("color:#666; font-size:10px; font-weight:bold;")
+            hdr.setAlignment(Qt.AlignCenter if col else Qt.AlignLeft)
+            bp_grid.addWidget(hdr, 0, col)
+        for row_idx, row in enumerate(breakpoint_info["rows"], 1):
+            status_color = {
+                "locked": QColor(98, 194, 135),
+                "can hit 7": QColor(143, 201, 230),
+                "one step off": QColor(216, 181, 106),
+                "stalled": QColor(190, 145, 40),
+            }.get(row["status"], QColor(120, 120, 135))
+            stat_lbl = QLabel(row["stat"])
+            range_lbl = QLabel(f"{row['lo']}-{row['hi']}" if row["lo"] != row["hi"] else str(row["lo"]))
+            exp_lbl = QLabel(f"{row['expected']:.1f}")
+            status_lbl = QLabel(row["status"])
+            for lbl in (range_lbl, exp_lbl, status_lbl):
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet(
+                    f"color:rgb({status_color.red()},{status_color.green()},{status_color.blue()}); font-size:10px;"
+                )
+            stat_lbl.setStyleSheet("color:#ddd; font-size:10px;")
+            bp_grid.addWidget(stat_lbl, row_idx, 0)
+            bp_grid.addWidget(range_lbl, row_idx, 1)
+            bp_grid.addWidget(exp_lbl, row_idx, 2)
+            bp_grid.addWidget(status_lbl, row_idx, 3)
+        bp.addLayout(bp_grid)
+
+        root.addLayout(bp)
 
         # ── Appearance preview + lineage ───────────────────────────────────
         bot = QHBoxLayout()
@@ -5796,6 +6013,7 @@ class PerfectCatPlannerView(QWidget):
         stage1_actions = []
         for idx, pair in enumerate(selected_pairs, 1):
             projection = pair["projection"]
+            bp = _pair_breakpoint_analysis(pair["cat_a"], pair["cat_b"], stimulation)
             stage1_actions.append({
                 "action": f"Pair {idx}",
                 "target": _pair_name(pair),
@@ -5804,9 +6022,8 @@ class PerfectCatPlannerView(QWidget):
                 "why": (
                     f"Fast foundation pair for a perfect-7 line. "
                     f"Projected 7+ coverage: {projection['seven_plus_total']:.1f}/7 at stimulation {int(stimulation)}. "
-                    f"Locks: {_fmt_stats(projection['locked_stats'])}. "
-                    f"Can hit 7: {_fmt_stats([s for s in projection['reachable_stats'] if s not in projection['locked_stats']])}. "
-                    f"Still below 7: {_fmt_stats(projection['missing_stats'])}."
+                    f"Breakpoint: {bp['headline']}. "
+                    + " ".join(bp["hints"][:2])
                 ),
                 "children": (
                     "Keep the strongest son and daughter if possible. "
@@ -5897,6 +6114,7 @@ class PerfectCatPlannerView(QWidget):
             else:
                 source_note = "founder line" if not get_parents(rotation["candidate"]) else "existing line"
                 rotated_projection = _offspring_projection(rotation["parent"], rotation["candidate"])
+                rotated_bp = _pair_breakpoint_analysis(rotation["parent"], rotation["candidate"], stimulation)
                 stage3_import_counts.append(float(len(rotation["bring_stats"])))
                 stage3_actions.append({
                     "action": f"Pair {idx} Rotation",
@@ -5914,9 +6132,8 @@ class PerfectCatPlannerView(QWidget):
                         f"Use this {source_note} outcross when Pair {idx} stalls on {_fmt_stats(missing)}. "
                         f"It covers missing 7-stats without falling back to family breeding. "
                         f"Projected 7+ coverage: {rotated_projection['seven_plus_total']:.1f}/7 at stimulation {int(stimulation)}. "
-                        f"Locks: {_fmt_stats(rotated_projection['locked_stats'])}. "
-                        f"Can hit 7: {_fmt_stats([s for s in rotated_projection['reachable_stats'] if s not in rotated_projection['locked_stats']])}. "
-                        f"Still below 7: {_fmt_stats(rotated_projection['missing_stats'])}."
+                        f"Breakpoint: {rotated_bp['headline']}. "
+                        + " ".join(rotated_bp["hints"][:2])
                     ),
                     "children": (
                         "Promote the kitten that keeps the old locked stats while adding the missing stat coverage."
@@ -6763,6 +6980,28 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_all)
         self._room_btns[None] = self._btn_all
 
+        self._btn_exceptional = _sidebar_btn(f"Exceptional  (>= {EXCEPTIONAL_SUM_THRESHOLD})")
+        self._btn_exceptional.setToolTip(
+            f"Exceptional breeders: base stat sum >= {EXCEPTIONAL_SUM_THRESHOLD}."
+        )
+        self._btn_exceptional.clicked.connect(
+            lambda: self._filter("__exceptional__", self._btn_exceptional)
+        )
+        vb.addWidget(self._btn_exceptional)
+        self._room_btns["__exceptional__"] = self._btn_exceptional
+
+        self._btn_donation = _sidebar_btn(f"Donation Candidates  (<= {DONATION_SUM_THRESHOLD})")
+        self._btn_donation.setToolTip(
+            "Donation candidates use documented heuristics: "
+            f"base stat sum <= {DONATION_SUM_THRESHOLD}, "
+            f"top stat <= {DONATION_MAX_TOP_STAT}, and/or high aggression."
+        )
+        self._btn_donation.clicked.connect(
+            lambda: self._filter("__donation__", self._btn_donation)
+        )
+        vb.addWidget(self._btn_donation)
+        self._room_btns["__donation__"] = self._btn_donation
+
         self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
         self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
         vb.addWidget(self._btn_room_optimizer)
@@ -7295,6 +7534,10 @@ class MainWindow(QMainWindow):
             self._header_lbl.setText("All Cats")
         elif room_key is None:
             self._header_lbl.setText("Alive")
+        elif room_key == "__exceptional__":
+            self._header_lbl.setText("Exceptional Cats")
+        elif room_key == "__donation__":
+            self._header_lbl.setText("Donation Candidates")
         elif room_key == "__gone__":
             self._header_lbl.setText("Gone")
         elif room_key == "__adventure__":
@@ -7331,6 +7574,10 @@ class MainWindow(QMainWindow):
             return
         cal_explicit, cal_token, cal_rows = _apply_calibration(self._current_save, self._cats)
         self._source_model.load(self._cats)
+        exceptional = sum(1 for c in self._cats if c.status != "Gone" and _is_exceptional_breeder(c))
+        donation = sum(1 for c in self._cats if c.status != "Gone" and _is_donation_candidate(c))
+        self._btn_exceptional.setText(f"Exceptional  ({exceptional})")
+        self._btn_donation.setText(f"Donation Candidates  ({donation})")
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
         if self._breeding_partners_view is not None:
@@ -7366,10 +7613,14 @@ class MainWindow(QMainWindow):
             # Update fixed sidebar button counts
             total = len(cats)
             alive = sum(1 for c in cats if c.status != "Gone")
+            exceptional = sum(1 for c in cats if c.status != "Gone" and _is_exceptional_breeder(c))
+            donation = sum(1 for c in cats if c.status != "Gone" and _is_donation_candidate(c))
             adv   = sum(1 for c in cats if c.status == "Adventure")
             gone  = sum(1 for c in cats if c.status == "Gone")
             self._btn_everyone.setText(f"All Cats  ({total})")
             self._btn_all.setText(f"Alive Cats  ({alive})")
+            self._btn_exceptional.setText(f"Exceptional  ({exceptional})")
+            self._btn_donation.setText(f"Donation Candidates  ({donation})")
             self._btn_adventure.setText(f"On Adventure  ({adv})")
             self._btn_gone.setText(f"Gone  ({gone})")
             self._filter(None, self._btn_all)
