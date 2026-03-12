@@ -13,6 +13,12 @@ It reads your save, shows the cats in a sortable live table, and adds planning v
 - Loads ability and mutation descriptions from `resources.gpak` when available
 - Helps plan toward perfect 7-base-stat lines with staged pairing guidance
 
+---
+
+[Main Roster](#main-roster) | [Single-Cat Detail View](#single-cat-detail-view) | [Breeding Comparison](#breeding-comparison-view) | [Room Optimizer](#room-optimizer) | [Perfect 7 Planner](#perfect-7-planner) | [Family Tree](#family-tree-view) | [Safe Breeding](#safe-breeding-view) | [Breeding Partners](#breeding-partners-view) | [Exceptional Cats](#exceptional-cats-view) | [Donation Candidates](#donation-candidates-view) | [Calibration](#calibration-view)
+
+---
+
 ## Main Features
 
 ### Main roster
@@ -308,6 +314,17 @@ This is useful, but still experimental for very complex pedigrees.
 - Sexuality / gayness is not fully mapped yet
 - Ability / mutation text quality depends on available game data
 - Inbreeding and family analysis are good enough to use, but should still be treated as save-research features rather than absolute ground truth
+
+## Changelog
+
+1.7.0 lots of new features. perfect 7 planner. added a filter for exceptional cats and for donation candidates. performance optimization. lots of suggestions from [Daedmano](https://www.nexusmods.com/profile/Deadmano).
+1.6.0 fixed mutations and a few other bugs. thanks to [byronaltice](https://github.com/frankieg33/MewgenicsBreedingManager/pull/32).
+1.5.0 tagged cats in game are now taken into account, which should fix gender going forward.
+1.4.0 added an override ability for gender
+1.3.1 added a blacklist to the room optimization view
+1.3.0 added detail to the room optimizer
+1.2.0 added a room optimizer thanks to [ICaxapI](https://github.com/ICaxapI)
+1.1.0 updated the gender logic thanks to [heartskingu](https://github.com/frankieg33/MewgenicsBreedingManager/pull/1)
 
 ## Credits
 
