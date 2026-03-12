@@ -1110,7 +1110,7 @@ class Cat:
 
         # Optional post-name tag string (empty for most cats). Some fields below
         # are anchored to the byte immediately after this string.
-        r.str()
+        self.name_tag = r.str() or ""
         personality_anchor = r.pos
 
         # Possible parent UIDs — fixed-position attempt.
@@ -1134,7 +1134,7 @@ class Cat:
         self.visual_mutation_ids = [int(entry["mutation_id"]) for entry in visual_entries]
         visual_display_names = [text for text, _ in visual_items]
 
-        r.skip(12)
+        self.gender_token_fields = tuple(r.u32() for _ in range(3))
         raw_gender = r.str()
         self.gender_token = (raw_gender or "").strip().lower()
         # Authoritative sex enum near the name block:
@@ -3690,6 +3690,128 @@ class SafeBreedingView(QWidget):
             self._table.setItem(row, 3, risk_item)
 
 
+class BreedingPartnersView(QWidget):
+    """Dedicated view for mutual-lover breeding pairs and room mismatches."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+        )
+        self._cats: list[Cat] = []
+        self._pairs: list[dict[str, object]] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._title = QLabel("Breeding Partners")
+        self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#666; font-size:11px;")
+        header.addWidget(self._title)
+        header.addStretch()
+        header.addWidget(self._summary)
+        root.addLayout(header)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search partner names or rooms…")
+        root.addWidget(self._search)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["Cat A", "Cat B", "Room A", "Room B", "Status"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setSortingEnabled(False)
+        hh = self._table.horizontalHeader()
+        for col in range(4):
+            hh.setSectionResizeMode(col, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)
+        self._table.setColumnWidth(4, 120)
+        root.addWidget(self._table, 1)
+
+        self._search.textChanged.connect(self._refresh_table)
+        _enforce_min_font_in_widget_tree(self)
+
+    def set_cats(self, cats: list[Cat]):
+        self._cats = cats
+        self._pairs = []
+        seen: set[tuple[int, int]] = set()
+        alive = [c for c in cats if c.status != "Gone"]
+        for cat in alive:
+            for lover in cat.lovers:
+                if lover.status == "Gone":
+                    continue
+                if cat not in lover.lovers:
+                    continue
+                key = (cat.db_key, lover.db_key) if cat.db_key < lover.db_key else (lover.db_key, cat.db_key)
+                if key in seen:
+                    continue
+                seen.add(key)
+                same_room = bool(cat.room and lover.room and cat.room == lover.room and cat.status == lover.status == "In House")
+                self._pairs.append({
+                    "cat_a": cat,
+                    "cat_b": lover,
+                    "room_a": cat.room_display or cat.status,
+                    "room_b": lover.room_display or lover.status,
+                    "same_room": same_room,
+                })
+        self._pairs.sort(key=lambda p: (
+            not bool(p["same_room"]),
+            str(p["cat_a"].name).lower(),
+            str(p["cat_b"].name).lower(),
+        ))
+        self._refresh_table()
+
+    def _refresh_table(self):
+        query = self._search.text().strip().lower()
+        pairs = self._pairs
+        if query:
+            pairs = [
+                p for p in pairs
+                if query in " ".join([
+                    p["cat_a"].name.lower(),
+                    p["cat_b"].name.lower(),
+                    str(p["room_a"]).lower(),
+                    str(p["room_b"]).lower(),
+                ])
+            ]
+
+        self._table.setRowCount(len(pairs))
+        mismatch_count = 0
+        for row, pair in enumerate(pairs):
+            same_room = bool(pair["same_room"])
+            if not same_room:
+                mismatch_count += 1
+            status_text = "Same Room" if same_room else "Mismatch"
+            status_color = QColor(98, 194, 135) if same_room else QColor(216, 181, 106)
+            items = [
+                QTableWidgetItem(f"{pair['cat_a'].name} ({pair['cat_a'].gender_display})"),
+                QTableWidgetItem(f"{pair['cat_b'].name} ({pair['cat_b'].gender_display})"),
+                QTableWidgetItem(str(pair["room_a"])),
+                QTableWidgetItem(str(pair["room_b"])),
+                QTableWidgetItem(status_text),
+            ]
+            items[4].setTextAlignment(Qt.AlignCenter)
+            items[4].setForeground(QBrush(status_color))
+            if not same_room:
+                for item in items[:4]:
+                    item.setBackground(QBrush(QColor(48, 36, 14)))
+            for col, item in enumerate(items):
+                self._table.setItem(row, col, item)
+
+        total = len(self._pairs)
+        shown = len(pairs)
+        self._summary.setText(f"{shown} / {total} mutual-lover pairs  |  mismatches: {mismatch_count}")
+
+
 # ── Room Optimizer View ───────────────────────────────────────────────────────
 
 class RoomOptimizerView(QWidget):
@@ -3917,10 +4039,34 @@ class RoomOptimizerView(QWidget):
         stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
         ancestor_paths = {cat.db_key: _ancestor_paths(cat) for cat in alive_cats}
         pair_eval_cache: dict[tuple[int, int], tuple[bool, str, float]] = {}
+        hater_key_map: dict[int, set[int]] = {
+            cat.db_key: {other.db_key for other in getattr(cat, "haters", [])}
+            for cat in alive_cats
+        }
+        lover_key_map: dict[int, set[int]] = {
+            cat.db_key: {other.db_key for other in getattr(cat, "lovers", [])}
+            for cat in alive_cats
+        }
 
         def _pair_key(cat_a: Cat, cat_b: Cat) -> tuple[int, int]:
             a_key, b_key = cat_a.db_key, cat_b.db_key
             return (a_key, b_key) if a_key < b_key else (b_key, a_key)
+
+        def _is_hater_conflict(cat_a: Cat, cat_b: Cat) -> bool:
+            haters_a = hater_key_map.get(cat_a.db_key, set())
+            haters_b = hater_key_map.get(cat_b.db_key, set())
+            return cat_b.db_key in haters_a or cat_a.db_key in haters_b
+
+        def _is_mutual_lover_pair(cat_a: Cat, cat_b: Cat) -> bool:
+            lovers_a = lover_key_map.get(cat_a.db_key, set())
+            lovers_b = lover_key_map.get(cat_b.db_key, set())
+            return cat_b.db_key in lovers_a and cat_a.db_key in lovers_b
+
+        def _room_conflict(cat_a: Cat, cat_b: Cat) -> bool:
+            if _is_hater_conflict(cat_a, cat_b):
+                return True
+            ok, _, risk = _pair_eval(cat_a, cat_b)
+            return ok and risk > max_risk
 
         def _pair_eval(cat_a: Cat, cat_b: Cat) -> tuple[bool, str, float]:
             key = _pair_key(cat_a, cat_b)
@@ -3928,6 +4074,9 @@ class RoomOptimizerView(QWidget):
             if cached is not None:
                 return cached
             ok, reason = can_breed(cat_a, cat_b)
+            if ok and _is_hater_conflict(cat_a, cat_b):
+                ok = False
+                reason = "These cats hate each other"
             if ok:
                 pa = ancestor_paths.get(cat_a.db_key) or {}
                 pb = ancestor_paths.get(cat_b.db_key) or {}
@@ -3964,6 +4113,13 @@ class RoomOptimizerView(QWidget):
                 room_data = family_assignments[room_key]
                 return room_data["males"] + room_data["females"] + room_data["unknown"]
 
+            def _preferred_rooms(cat: Cat) -> list[str]:
+                lover_rooms: list[str] = []
+                for room in all_rooms:
+                    if any(_is_mutual_lover_pair(cat, existing_cat) for existing_cat in _room_cats(room)):
+                        lover_rooms.append(room)
+                return lover_rooms + [room for room in all_rooms if room not in lover_rooms]
+
             def _family_group_id(cat: Cat):
                 ancestors = []
                 if cat.parent_a:
@@ -3998,8 +4154,7 @@ class RoomOptimizerView(QWidget):
                 for family_id, family_cats in family_groups.items():
                     for cat in family_cats:
                         placed = False
-                        for _ in range(len(all_rooms)):
-                            room = all_rooms[room_idx % len(all_rooms)]
+                        for room in _preferred_rooms(cat):
                             room_cats = _room_cats(room)
                             if len(room_cats) < max_cats_per_room:
                                 has_family_conflict = False
@@ -4008,27 +4163,31 @@ class RoomOptimizerView(QWidget):
                                     if _family_group_id(existing_cat) == family_id:
                                         has_family_conflict = True
                                         break
-                                    if _pair_eval(cat, existing_cat)[2] > max_risk:
+                                    if _room_conflict(cat, existing_cat):
                                         has_risk_conflict = True
                                         break
                                 if not has_family_conflict and not has_risk_conflict:
                                     family_assignments[room][gender_key].append(cat)
                                     placed = True
-                                    room_idx += 1
                                     break
-                            room_idx += 1
 
                         if not placed:
                             best_room = None
-                            best_avg_risk = float("inf")
-                            for room in all_rooms:
+                            best_score = float("-inf")
+                            for room in _preferred_rooms(cat):
                                 room_cats = _room_cats(room)
                                 if len(room_cats) >= max_cats_per_room:
                                     continue
-                                risks = [_pair_eval(cat, existing_cat)[2] for existing_cat in room_cats]
+                                risks = [
+                                    _pair_eval(cat, existing_cat)[2]
+                                    for existing_cat in room_cats
+                                    if not _is_hater_conflict(cat, existing_cat)
+                                ]
                                 avg_risk = (sum(risks) / len(risks)) if risks else 0.0
-                                if avg_risk < best_avg_risk:
-                                    best_avg_risk = avg_risk
+                                lover_bonus = sum(1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)) * 1000.0
+                                score = lover_bonus - avg_risk
+                                if score > best_score:
+                                    best_score = score
                                     best_room = room
                             if best_room is None:
                                 best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
@@ -4037,33 +4196,36 @@ class RoomOptimizerView(QWidget):
                 # Then place strays / no-family cats by lowest-risk fit.
                 for cat in no_family:
                     placed = False
-                    for _ in range(len(all_rooms)):
-                        room = all_rooms[room_idx % len(all_rooms)]
+                    for room in _preferred_rooms(cat):
                         room_cats = _room_cats(room)
                         if len(room_cats) < max_cats_per_room:
                             has_risk_conflict = False
                             for existing_cat in room_cats:
-                                if _pair_eval(cat, existing_cat)[2] > max_risk:
+                                if _room_conflict(cat, existing_cat):
                                     has_risk_conflict = True
                                     break
                             if not has_risk_conflict:
                                 family_assignments[room][gender_key].append(cat)
                                 placed = True
-                                room_idx += 1
                                 break
-                        room_idx += 1
 
                     if not placed:
                         best_room = None
-                        best_avg_risk = float("inf")
-                        for room in all_rooms:
+                        best_score = float("-inf")
+                        for room in _preferred_rooms(cat):
                             room_cats = _room_cats(room)
                             if len(room_cats) >= max_cats_per_room:
                                 continue
-                            risks = [_pair_eval(cat, existing_cat)[2] for existing_cat in room_cats]
+                            risks = [
+                                _pair_eval(cat, existing_cat)[2]
+                                for existing_cat in room_cats
+                                if not _is_hater_conflict(cat, existing_cat)
+                            ]
                             avg_risk = (sum(risks) / len(risks)) if risks else 0.0
-                            if avg_risk < best_avg_risk:
-                                best_avg_risk = avg_risk
+                            lover_bonus = sum(1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)) * 1000.0
+                            score = lover_bonus - avg_risk
+                            if score > best_score:
+                                best_score = score
                                 best_room = room
                         if best_room is None:
                             best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
@@ -4131,17 +4293,23 @@ class RoomOptimizerView(QWidget):
                     if cat_a.must_breed or cat_b.must_breed:
                         must_breed_bonus = 1000  # Ensures must-breed pairs sort first
 
+                    lover_bonus = 500.0 if _is_mutual_lover_pair(cat_a, cat_b) else 0.0
+
                     pairs_with_scores.append({
                         'cat_a': cat_a,
                         'cat_b': cat_b,
                         'risk': risk,
                         'avg_stats': avg_base_stats,
                         'quality': quality,
-                        'must_breed_bonus': must_breed_bonus
+                        'must_breed_bonus': must_breed_bonus,
+                        'lover_bonus': lover_bonus,
                     })
 
-            # Sort with must-breed pairs first, then by quality
-            pairs_with_scores.sort(key=lambda p: (p['must_breed_bonus'], p['quality']), reverse=True)
+            # Sort with must-breed pairs first, then mutual lovers, then by quality.
+            pairs_with_scores.sort(
+                key=lambda p: (p['must_breed_bonus'], p['lover_bonus'], p['quality']),
+                reverse=True,
+            )
             assigned_cats = set()
             max_cats_per_priority_room = 6
 
@@ -4159,13 +4327,11 @@ class RoomOptimizerView(QWidget):
 
                     can_place_both = True
                     for existing_cat in room_cats:
-                        ok_a, _, risk_a = _pair_eval(cat_a, existing_cat)
-                        if ok_a and risk_a > max_risk:
+                        if _room_conflict(cat_a, existing_cat):
                             can_place_both = False
                             break
 
-                        ok_b, _, risk_b = _pair_eval(cat_b, existing_cat)
-                        if ok_b and risk_b > max_risk:
+                        if _room_conflict(cat_b, existing_cat):
                             can_place_both = False
                             break
 
@@ -4180,15 +4346,21 @@ class RoomOptimizerView(QWidget):
                     for cat in [cat_a, cat_b]:
                         if cat.db_key in assigned_cats:
                             continue
-                        for room in priority_rooms:
+                        preferred_rooms = sorted(
+                            priority_rooms,
+                            key=lambda room: (
+                                not any(_is_mutual_lover_pair(cat, existing_cat) for existing_cat in room_assignments[room]),
+                                len(room_assignments[room]),
+                            ),
+                        )
+                        for room in preferred_rooms:
                             room_cats = room_assignments[room]
                             if len(room_cats) >= max_cats_per_priority_room:
                                 continue
 
                             compatible = True
                             for existing_cat in room_cats:
-                                ok, _, risk = _pair_eval(cat, existing_cat)
-                                if ok and risk > max_risk:
+                                if _room_conflict(cat, existing_cat):
                                     compatible = False
                                     break
                             if compatible:
@@ -4499,23 +4671,24 @@ class CalibrationView(QWidget):
     COL_NAME = 0
     COL_STATUS = 1
     COL_TOKEN = 2
-    COL_PARSED_G = 3
-    COL_OVR_G = 4
-    COL_PARSED_AGE = 5
-    COL_OVR_AGE = 6
-    COL_PARSED_AGG = 7
-    COL_OVR_AGG = 8
-    COL_PARSED_LIB = 9
-    COL_OVR_LIB = 10
-    COL_PARSED_INB = 11
-    COL_OVR_INB = 12
-    COL_OVR_STR = 13
-    COL_OVR_DEX = 14
-    COL_OVR_CON = 15
-    COL_OVR_INT = 16
-    COL_OVR_SPD = 17
-    COL_OVR_CHA = 18
-    COL_OVR_LCK = 19
+    COL_TOKEN_FIELDS = 3
+    COL_PARSED_G = 4
+    COL_OVR_G = 5
+    COL_PARSED_AGE = 6
+    COL_OVR_AGE = 7
+    COL_PARSED_AGG = 8
+    COL_OVR_AGG = 9
+    COL_PARSED_LIB = 10
+    COL_OVR_LIB = 11
+    COL_PARSED_INB = 12
+    COL_OVR_INB = 13
+    COL_OVR_STR = 14
+    COL_OVR_DEX = 15
+    COL_OVR_CON = 16
+    COL_OVR_INT = 17
+    COL_OVR_SPD = 18
+    COL_OVR_CHA = 19
+    COL_OVR_LCK = 20
 
     class _AgeNumericDelegate(QStyledItemDelegate):
         def createEditor(self, parent, option, index):
@@ -4587,9 +4760,9 @@ class CalibrationView(QWidget):
         actions.addWidget(self._status)
         root.addLayout(actions)
 
-        self._table = QTableWidget(0, 20)
+        self._table = QTableWidget(0, 21)
         self._table.setHorizontalHeaderLabels([
-            "Name", "Status", "Voice", "Parsed G", "Override G",
+            "Name", "Status", "Gender Token", "Pre-G U32s", "Parsed G", "Override G",
             "Parsed Age", "Override Age",
             "Parsed Agg", "Override Agg",
             "Parsed Libido", "Override Libido",
@@ -4612,6 +4785,7 @@ class CalibrationView(QWidget):
         hh.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_TOKEN, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_TOKEN_FIELDS, QHeaderView.ResizeToContents)
         for col in (self.COL_PARSED_G, self.COL_OVR_G):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self._table.setColumnWidth(col, 84)
@@ -4651,6 +4825,13 @@ class CalibrationView(QWidget):
         it = QTableWidgetItem(text)
         it.setFlags(it.flags() & ~Qt.ItemIsEditable)
         return it
+
+    @staticmethod
+    def _fmt_gender_token_fields(cat: Cat) -> str:
+        vals = getattr(cat, "gender_token_fields", None)
+        if not vals:
+            return ""
+        return ", ".join(str(int(v)) for v in vals)
 
     @staticmethod
     def _editable_item(text: str) -> QTableWidgetItem:
@@ -4709,6 +4890,7 @@ class CalibrationView(QWidget):
             self._table.setItem(row, self.COL_NAME, self._readonly_item(cat.name or "?"))
             self._table.setItem(row, self.COL_STATUS, self._readonly_item(cat.status))
             self._table.setItem(row, self.COL_TOKEN, self._readonly_item(getattr(cat, "gender_token", "") or ""))
+            self._table.setItem(row, self.COL_TOKEN_FIELDS, self._readonly_item(self._fmt_gender_token_fields(cat)))
             self._table.setItem(row, self.COL_PARSED_G, self._readonly_item((getattr(cat, "parsed_gender", cat.gender) or "?")))
             self._table.setCellWidget(row, self.COL_OVR_G, self._gender_combo(str(ov.get("gender", "") or "")))
 
@@ -4912,6 +5094,7 @@ class MainWindow(QMainWindow):
         self._show_lineage: bool = False
         self._tree_view: Optional[FamilyTreeBrowserView] = None
         self._safe_breeding_view: Optional[SafeBreedingView] = None
+        self._breeding_partners_view: Optional[BreedingPartnersView] = None
         self._room_optimizer_view: Optional[RoomOptimizerView] = None
         self._calibration_view: Optional[CalibrationView] = None
         self._zoom_percent: int = 100
@@ -5184,6 +5367,9 @@ class MainWindow(QMainWindow):
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
         self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
         vb.addWidget(self._btn_safe_breeding_view)
+        self._btn_breeding_partners_view = _sidebar_btn("Breeding Partners")
+        self._btn_breeding_partners_view.clicked.connect(self._open_breeding_partners_view)
+        vb.addWidget(self._btn_breeding_partners_view)
         self._btn_tree_view = _sidebar_btn("Family Tree View")
         self._btn_tree_view.clicked.connect(self._open_tree_browser)
         vb.addWidget(self._btn_tree_view)
@@ -5405,6 +5591,9 @@ class MainWindow(QMainWindow):
         self._safe_breeding_view = SafeBreedingView(self)
         self._safe_breeding_view.hide()
         vb.addWidget(self._safe_breeding_view, 1)
+        self._breeding_partners_view = BreedingPartnersView(self)
+        self._breeding_partners_view.hide()
+        vb.addWidget(self._breeding_partners_view, 1)
         self._room_optimizer_view = RoomOptimizerView(self)
         self._room_optimizer_view.hide()
         vb.addWidget(self._room_optimizer_view, 1)
@@ -5468,6 +5657,8 @@ class MainWindow(QMainWindow):
             self._tree_view.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
@@ -5480,6 +5671,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
         if hasattr(self, "_btn_calibration"):
@@ -5495,6 +5688,8 @@ class MainWindow(QMainWindow):
             self._table_view_container.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
@@ -5506,6 +5701,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(True)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
         if hasattr(self, "_btn_calibration"):
@@ -5521,6 +5718,8 @@ class MainWindow(QMainWindow):
             self._table_view_container.hide()
         if hasattr(self, "_tree_view") and self._tree_view is not None:
             self._tree_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
@@ -5532,6 +5731,38 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(True)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_calibration"):
+            self._btn_calibration.setChecked(False)
+
+    def _show_breeding_partners_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
+        if hasattr(self, "_calibration_view") and self._calibration_view is not None:
+            self._calibration_view.hide()
+        if self._breeding_partners_view is not None:
+            self._breeding_partners_view.set_cats(self._cats)
+            self._breeding_partners_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(True)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
         if hasattr(self, "_btn_calibration"):
@@ -5549,6 +5780,8 @@ class MainWindow(QMainWindow):
             self._tree_view.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
         if self._room_optimizer_view is not None:
@@ -5558,6 +5791,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(True)
         if hasattr(self, "_btn_calibration"):
@@ -5575,6 +5810,8 @@ class MainWindow(QMainWindow):
             self._tree_view.hide()
         if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
             self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
         if self._calibration_view is not None:
@@ -5585,6 +5822,8 @@ class MainWindow(QMainWindow):
             self._btn_tree_view.setChecked(False)
         if hasattr(self, "_btn_safe_breeding_view"):
             self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
         if hasattr(self, "_btn_calibration"):
@@ -5619,6 +5858,8 @@ class MainWindow(QMainWindow):
             _save_must_breed(self._current_save, self._cats)
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
+        if self._breeding_partners_view is not None:
+            self._breeding_partners_view.set_cats(self._cats)
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
 
@@ -5629,6 +5870,8 @@ class MainWindow(QMainWindow):
         self._source_model.load(self._cats)
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
+        if self._breeding_partners_view is not None:
+            self._breeding_partners_view.set_cats(self._cats)
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
         if self._calibration_view is not None and self._calibration_view.isVisible():
@@ -5669,6 +5912,8 @@ class MainWindow(QMainWindow):
                 self._tree_view.set_cats(cats)
             if self._safe_breeding_view is not None:
                 self._safe_breeding_view.set_cats(cats)
+            if self._breeding_partners_view is not None:
+                self._breeding_partners_view.set_cats(cats)
             if self._room_optimizer_view is not None:
                 self._room_optimizer_view.set_cats(cats)
             if self._calibration_view is not None:
@@ -5735,6 +5980,9 @@ class MainWindow(QMainWindow):
         cats = [c for r in rows[:1] if (c := self._source_model.cat_at(r)) is not None]
         if cats and self._safe_breeding_view is not None:
             self._safe_breeding_view.select_cat(cats[0])
+
+    def _open_breeding_partners_view(self):
+        self._show_breeding_partners_view()
 
     def _open_room_optimizer(self):
         self._show_room_optimizer_view()
