@@ -1072,6 +1072,34 @@ def _visual_mutation_chip_items(entries: list[dict[str, object]]) -> list[tuple[
     return chip_items
 
 
+def _appearance_group_names(cat: 'Cat', group_key: str) -> list[str]:
+    entries = getattr(cat, "visual_mutation_entries", []) or []
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if str(entry.get("group_key")) != group_key:
+            continue
+        name = str(entry.get("name", "")).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if names:
+        return names
+    if group_key in {"fur", "body", "head"}:
+        return [f"Base {_VISUAL_MUTATION_PART_LABELS.get(group_key, group_key).title()}"]
+    return []
+
+
+def _appearance_preview_text(a_names: list[str], b_names: list[str]) -> str:
+    if not a_names and not b_names:
+        return "No distinct appearance data"
+    a_text = " / ".join(a_names) if a_names else "Base"
+    b_text = " / ".join(b_names) if b_names else "Base"
+    if set(a_names) == set(b_names):
+        return f"Likely {a_text}"
+    return f"Probabilistic: {a_text} or {b_text}"
+
+
 # ── Cat ───────────────────────────────────────────────────────────────────────
 
 class Cat:
@@ -1131,6 +1159,7 @@ class Cat:
         }
         visual_entries = _read_visual_mutation_entries(T)
         visual_items = _visual_mutation_chip_items(visual_entries)
+        self.visual_mutation_entries = visual_entries
         self.visual_mutation_ids = [int(entry["mutation_id"]) for entry in visual_entries]
         visual_display_names = [text for text, _ in visual_items]
 
@@ -2499,6 +2528,30 @@ def _detail_text_block(lines: list[str], style: str = _DETAIL_TEXT_STYLE) -> QWi
     return box
 
 
+def _wrapped_chip_block(items, tooltip_fn=None, display_fn=None, max_per_row: int = 5) -> QWidget:
+    box = QWidget()
+    layout = QVBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    if not items:
+        return box
+    for start in range(0, len(items), max_per_row):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+        for item in items[start:start + max_per_row]:
+            if isinstance(item, tuple):
+                text, tip = item
+                tip = tip or (tooltip_fn(text) if tooltip_fn else "")
+            else:
+                text = display_fn(item) if display_fn else item
+                tip = tooltip_fn(item) if tooltip_fn else ""
+            row.addWidget(_chip(text, tip))
+        row.addStretch()
+        layout.addLayout(row)
+    return box
+
+
 class ChipRow(QWidget):
     def __init__(self, items, tooltip_fn=None, display_fn=None):
         super().__init__()
@@ -2532,17 +2585,22 @@ class CatDetailPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 10, 14, 10)
         outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setStyleSheet("QScrollArea { border:none; background:#0a0a18; }")
         self._content = QWidget()
-        outer.addWidget(self._content)
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll)
 
     def set_show_lineage(self, show: bool):
         self._show_lineage = show
 
     def show_cats(self, cats: list[Cat]):
-        old = self._content
         self._content = QWidget()
-        self.layout().replaceWidget(old, self._content)
-        old.deleteLater()
+        self._scroll.setWidget(self._content)
 
         if not cats:
             self.setFixedHeight(0)
@@ -2984,39 +3042,75 @@ class CatDetailPanel(QWidget):
         ab_col.addWidget(_sec("ABILITIES"))
         for cat in (a, b):
             if cat.abilities or cat.passive_abilities:
-                row = QHBoxLayout()
-                row.setSpacing(5)
-                row.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
-                for ab in cat.abilities:
-                    row.addWidget(_chip(ab, _ability_tip(ab)))
-                for pa in cat.passive_abilities:
-                    row.addWidget(_chip(f"● {_mutation_display_name(pa)}", _ability_tip(pa)))
-                row.addStretch()
-                ab_col.addLayout(row)
+                ab_col.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
+                ability_items = [(ab, _ability_tip(ab)) for ab in cat.abilities]
+                ability_items.extend(
+                    (f"● {_mutation_display_name(pa)}", _ability_tip(pa))
+                    for pa in cat.passive_abilities
+                )
+                ab_col.addWidget(_wrapped_chip_block(ability_items, max_per_row=4))
         ab_col.addStretch()
         mid.addLayout(ab_col)
+        mid.addWidget(_vsep())
+
+        if a.mutations or b.mutations:
+            mu_col = QVBoxLayout()
+            mu_col.setSpacing(6)
+            mu_col.addWidget(_sec("MUTATIONS"))
+            for cat in (a, b):
+                if cat.mutations:
+                    mu_col.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
+                    mu_col.addWidget(_wrapped_chip_block(cat.mutation_chip_items, max_per_row=3))
+            mu_col.addStretch()
+            mid.addLayout(mu_col)
 
         root.addLayout(mid)
 
-        # ── Possible mutations + lineage ───────────────────────────────────
+        # ── Appearance preview + lineage ───────────────────────────────────
         bot = QHBoxLayout()
         bot.setSpacing(20)
 
-        if a.mutations or b.mutations:
-            mc = QVBoxLayout()
-            mc.setSpacing(4)
-            mc.addWidget(_sec("MUTATIONS"))
-            for cat in (a, b):
-                if cat.mutations:
-                    mrow = QHBoxLayout()
-                    mrow.setSpacing(5)
-                    mrow.addWidget(QLabel(f"{cat.name}:", styleSheet="color:#555; font-size:10px;"))
-                    for text, tip in cat.mutation_chip_items:
-                        mrow.addWidget(_chip(text, tip))
-                    mrow.addStretch()
-                    mc.addLayout(mrow)
-            mc.addStretch()
-            bot.addLayout(mc)
+        app_col = QVBoxLayout()
+        app_col.setSpacing(6)
+        app_col.addWidget(_sec("APPEARANCE PREVIEW"))
+        app_note = QLabel("Probabilistic preview from parent coat/body/part data.")
+        app_note.setStyleSheet(_META_STYLE)
+        app_note.setWordWrap(True)
+        app_col.addWidget(app_note)
+
+        appearance_groups = [
+            ("fur", "Fur"),
+            ("body", "Body"),
+            ("head", "Head"),
+            ("tail", "Tail"),
+            ("ears", "Ears"),
+            ("eyes", "Eyes"),
+            ("mouth", "Mouth"),
+        ]
+        shown_preview = False
+        for group_key, title in appearance_groups:
+            a_names = _appearance_group_names(a, group_key)
+            b_names = _appearance_group_names(b, group_key)
+            if not a_names and not b_names:
+                continue
+            shown_preview = True
+            row = QHBoxLayout()
+            row.setSpacing(5)
+            row.addWidget(QLabel(f"{title}:", styleSheet="color:#555; font-size:10px;"))
+            row.addWidget(_chip(" / ".join(a_names) if a_names else "Base"))
+            row.addWidget(QLabel("x", styleSheet="color:#444; font-size:10px;"))
+            row.addWidget(_chip(" / ".join(b_names) if b_names else "Base"))
+            row.addWidget(QLabel("->", styleSheet="color:#666; font-size:10px;"))
+            row.addWidget(_chip(_appearance_preview_text(a_names, b_names)))
+            row.addStretch()
+            app_col.addLayout(row)
+
+        if not shown_preview:
+            app_col.addWidget(QLabel("No distinct parent appearance data detected.", styleSheet=_META_STYLE))
+
+        app_col.addStretch()
+        bot.addLayout(app_col)
+        if self._show_lineage:
             bot.addWidget(_vsep())
 
         if self._show_lineage:
@@ -3905,7 +3999,7 @@ class RoomOptimizerView(QWidget):
 
         self._minimize_variance_checkbox = QPushButton()
         self._minimize_variance_checkbox.setCheckable(True)
-        self._minimize_variance_checkbox.setChecked(False)
+        self._minimize_variance_checkbox.setChecked(True)
         self._minimize_variance_checkbox.setStyleSheet(
             "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
             "border-radius:4px; padding:6px 12px; font-size:11px; }"
@@ -3920,7 +4014,7 @@ class RoomOptimizerView(QWidget):
 
         self._avoid_lovers_checkbox = QPushButton()
         self._avoid_lovers_checkbox.setCheckable(True)
-        self._avoid_lovers_checkbox.setChecked(False)
+        self._avoid_lovers_checkbox.setChecked(True)
         self._avoid_lovers_checkbox.setToolTip(
             "If enabled, cats that already have lovers will not be paired with other cats."
         )
@@ -3938,7 +4032,7 @@ class RoomOptimizerView(QWidget):
 
         self._prefer_low_aggression_checkbox = QPushButton()
         self._prefer_low_aggression_checkbox.setCheckable(True)
-        self._prefer_low_aggression_checkbox.setChecked(False)
+        self._prefer_low_aggression_checkbox.setChecked(True)
         self._prefer_low_aggression_checkbox.setToolTip(
             "If enabled, optimizer gives extra weight to lower-aggression cats."
         )
@@ -3956,7 +4050,7 @@ class RoomOptimizerView(QWidget):
 
         self._prefer_high_libido_checkbox = QPushButton()
         self._prefer_high_libido_checkbox.setCheckable(True)
-        self._prefer_high_libido_checkbox.setChecked(False)
+        self._prefer_high_libido_checkbox.setChecked(True)
         self._prefer_high_libido_checkbox.setToolTip(
             "If enabled, optimizer gives extra weight to higher-libido cats."
         )
