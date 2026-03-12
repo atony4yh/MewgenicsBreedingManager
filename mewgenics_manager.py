@@ -4638,6 +4638,21 @@ class RoomOptimizerDetailPanel(QWidget):
         """)
         root.addWidget(self._pairs_table, 1)
 
+    @staticmethod
+    def _range_background(lo: int, hi: int) -> QColor:
+        base = STAT_COLORS.get(max(lo, hi), QColor(100, 100, 115))
+        if lo != hi:
+            return QColor(
+                min(255, int(base.red() * 0.55) + 22),
+                min(255, int(base.green() * 0.55) + 22),
+                min(255, int(base.blue() * 0.55) + 22),
+            )
+        return QColor(
+            min(255, int(base.red() * 0.7) + 18),
+            min(255, int(base.green() * 0.7) + 18),
+            min(255, int(base.blue() * 0.7) + 18),
+        )
+
     def show_room(self, data: Optional[dict]):
         if not data:
             self._summary.setText("Select a room to see pair details.")
@@ -4664,12 +4679,16 @@ class RoomOptimizerDetailPanel(QWidget):
             pair_item = QTableWidgetItem(f"{pair['cat_a']} x {pair['cat_b']}")
             sum_lo, sum_hi = pair.get("sum_range", (0, 0))
             sum_item = QTableWidgetItem(f"{sum_lo}-{sum_hi}")
+            sum_item.setToolTip(f"Possible offspring stat sum range: {sum_lo} to {sum_hi}")
             avg_item = QTableWidgetItem(f"{pair['avg_stats']:.1f}")
             stat_ranges = pair.get("stat_ranges", {})
             stat_items = []
             for stat in STAT_NAMES:
                 lo, hi = stat_ranges.get(stat, (0, 0))
-                stat_items.append(QTableWidgetItem(f"{lo}-{hi}"))
+                item = QTableWidgetItem(f"{lo}-{hi}")
+                item.setToolTip(f"{stat.upper()} offspring range: {lo} to {hi}")
+                item.setBackground(QBrush(self._range_background(lo, hi)))
+                stat_items.append(item)
             risk_item = QTableWidgetItem(f"{pair['risk']:.0f}%")
             rank_item = QTableWidgetItem(str(i))
 
@@ -4679,6 +4698,8 @@ class RoomOptimizerDetailPanel(QWidget):
             avg_item.setTextAlignment(Qt.AlignCenter)
             risk_item.setTextAlignment(Qt.AlignCenter)
             rank_item.setTextAlignment(Qt.AlignCenter)
+            sum_item.setBackground(QBrush(self._range_background(sum_lo // len(STAT_NAMES), sum_hi // len(STAT_NAMES))))
+            avg_item.setBackground(QBrush(self._range_background(int(pair['avg_stats']), int(pair['avg_stats']))))
 
             risk = float(pair["risk"])
             if risk >= 50:
@@ -5396,13 +5417,16 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_everyone)
         self._room_btns["__all__"] = self._btn_everyone
 
-        self._btn_all = _sidebar_btn("Alive")
+        self._btn_all = _sidebar_btn("Alive Cats")
         self._btn_all.setChecked(True)
         self._active_btn = self._btn_all
         self._btn_all.clicked.connect(lambda: self._filter(None, self._btn_all))
         vb.addWidget(self._btn_all)
         self._room_btns[None] = self._btn_all
 
+        self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
+        self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
+        vb.addWidget(self._btn_room_optimizer)
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
         self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
         vb.addWidget(self._btn_safe_breeding_view)
@@ -5412,9 +5436,6 @@ class MainWindow(QMainWindow):
         self._btn_tree_view = _sidebar_btn("Family Tree View")
         self._btn_tree_view.clicked.connect(self._open_tree_browser)
         vb.addWidget(self._btn_tree_view)
-        self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
-        self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
-        vb.addWidget(self._btn_room_optimizer)
         self._btn_calibration = _sidebar_btn("Calibration")
         self._btn_calibration.clicked.connect(self._open_calibration_view)
         vb.addWidget(self._btn_calibration)
@@ -5943,7 +5964,7 @@ class MainWindow(QMainWindow):
             adv   = sum(1 for c in cats if c.status == "Adventure")
             gone  = sum(1 for c in cats if c.status == "Gone")
             self._btn_everyone.setText(f"All Cats  ({total})")
-            self._btn_all.setText(f"Alive  ({alive})")
+            self._btn_all.setText(f"Alive Cats  ({alive})")
             self._btn_adventure.setText(f"On Adventure  ({adv})")
             self._btn_gone.setText(f"Gone  ({gone})")
             self._filter(None, self._btn_all)
