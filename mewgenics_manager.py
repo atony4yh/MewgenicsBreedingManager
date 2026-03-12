@@ -5064,6 +5064,998 @@ class RoomOptimizerDetailPanel(QWidget):
             self._pairs_table.setItem(i - 1, 11, rank_item)
 
 
+class PerfectPlannerDetailPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("background:#0a0a18; border-top:1px solid #1e1e38;")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(8)
+
+        self._summary = QLabel("Select a stage to see the plan details.")
+        self._summary.setStyleSheet("color:#aaa; font-size:12px;")
+        self._summary.setWordWrap(True)
+        root.addWidget(self._summary)
+
+        self._actions_table = QTableWidget(0, 6)
+        self._actions_table.setHorizontalHeaderLabels([
+            "Action", "Target", "Risk", "Why", "Children", "Rotate",
+        ])
+        self._actions_table.verticalHeader().setVisible(False)
+        self._actions_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._actions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._actions_table.setFocusPolicy(Qt.NoFocus)
+        self._actions_table.setWordWrap(True)
+        self._actions_table.setAlternatingRowColors(True)
+        hh = self._actions_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self._actions_table.setColumnWidth(2, 72)
+        self._actions_table.setStyleSheet("""
+            QTableWidget {
+                background:#0d0d1c; alternate-background-color:#131326;
+                color:#ddd; border:1px solid #26264a; font-size:12px;
+            }
+            QTableWidget::item { padding:4px 5px; }
+            QHeaderView::section {
+                background:#16213e; color:#888; padding:5px 4px;
+                border:none; border-bottom:1px solid #1e1e38;
+                border-right:1px solid #16213e; font-size:11px; font-weight:bold;
+            }
+        """)
+        root.addWidget(self._actions_table, 1)
+
+    @staticmethod
+    def _build_target_grid(action: dict) -> QWidget:
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
+
+        target_grid = action.get("target_grid") or {}
+        parents = target_grid.get("parents", [])
+        offspring = target_grid.get("offspring", {})
+
+        name_col_width = 96
+        for row_idx, header in enumerate(["", *STAT_NAMES, "Sum"]):
+            if row_idx == 0:
+                continue
+            hdr = QLabel(header)
+            hdr.setAlignment(Qt.AlignCenter)
+            hdr.setStyleSheet("color:#6f7fa0; font-size:10px; font-weight:bold;")
+            grid.addWidget(hdr, 0, row_idx)
+
+        def _parent_row(row: int, parent: dict):
+            name = QLabel(parent.get("name", ""))
+            name.setWordWrap(True)
+            name.setMinimumWidth(name_col_width)
+            name.setStyleSheet("color:#ddd; font-size:11px; font-weight:bold;")
+            grid.addWidget(name, row, 0)
+            for col, stat in enumerate(STAT_NAMES, 1):
+                value = int(parent.get("stats", {}).get(stat, 0))
+                c = STAT_COLORS.get(value, QColor(100, 100, 115))
+                lbl = QLabel(str(value))
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet(
+                    f"background:rgb({c.red()},{c.green()},{c.blue()});"
+                    "color:#fff; font-size:11px; font-weight:bold;"
+                    "border-radius:2px; padding:2px 6px;"
+                )
+                grid.addWidget(lbl, row, col)
+            sum_lbl = QLabel(str(int(parent.get("sum", 0))))
+            sum_lbl.setAlignment(Qt.AlignCenter)
+            sum_lbl.setStyleSheet("color:#9aa6ba; font-size:11px; font-weight:bold;")
+            grid.addWidget(sum_lbl, row, len(STAT_NAMES) + 1)
+
+        def _offspring_row(row: int, info: dict):
+            name = QLabel("Offspring")
+            name.setStyleSheet("color:#777; font-size:10px; font-style:italic;")
+            grid.addWidget(name, row, 0)
+            sum_lo, sum_hi = info.get("sum_range", (0, 0))
+            for col, stat in enumerate(STAT_NAMES, 1):
+                stat_info = info.get("stats", {}).get(stat, {})
+                lo = int(stat_info.get("lo", 0))
+                hi = int(stat_info.get("hi", 0))
+                expected = float(stat_info.get("expected", hi))
+                hi_color = STAT_COLORS.get(hi, QColor(100, 100, 115))
+                if lo == hi:
+                    text = f"{lo}"
+                else:
+                    text = f"{lo}-{hi}\n{expected:.1f}"
+                lbl = QLabel(text)
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setToolTip(f"{stat}: {lo}-{hi}, expected {expected:.1f}")
+                lbl.setStyleSheet(
+                    f"background:rgba({hi_color.red()},{hi_color.green()},{hi_color.blue()},110);"
+                    f"color:rgb({hi_color.red()},{hi_color.green()},{hi_color.blue()});"
+                    "font-size:10px; font-weight:bold; border-radius:2px; padding:2px 4px;"
+                )
+                grid.addWidget(lbl, row, col)
+            if sum_lo == sum_hi:
+                sum_text = str(sum_lo)
+            else:
+                sum_text = f"{sum_lo}-{sum_hi}"
+            sum_lbl = QLabel(sum_text)
+            sum_lbl.setAlignment(Qt.AlignCenter)
+            sum_lbl.setStyleSheet("color:#777; font-size:11px; font-weight:bold;")
+            grid.addWidget(sum_lbl, row, len(STAT_NAMES) + 1)
+
+        if len(parents) >= 1:
+            _parent_row(1, parents[0])
+        if len(parents) >= 2:
+            _parent_row(2, parents[1])
+        _offspring_row(3, offspring)
+        return container
+
+    def show_stage(self, data: Optional[dict]):
+        if not data:
+            self._summary.setText("Select a stage to see the plan details.")
+            self._summary.setToolTip("")
+            self._actions_table.setRowCount(0)
+            return
+
+        self._summary.setText(data.get("summary", ""))
+        notes = data.get("notes", [])
+        self._summary.setToolTip("\n".join(notes))
+
+        actions = data.get("actions", [])
+        self._actions_table.setRowCount(len(actions))
+        for row, action in enumerate(actions):
+            action_item = QTableWidgetItem(action.get("action", ""))
+            risk_value = action.get("risk")
+            risk_item = QTableWidgetItem("—" if risk_value is None else f"{float(risk_value):.0f}%")
+            why_item = QTableWidgetItem(action.get("why", ""))
+            children_item = QTableWidgetItem(action.get("children", ""))
+            rotate_item = QTableWidgetItem(action.get("rotate", ""))
+
+            risk_item.setTextAlignment(Qt.AlignCenter)
+            if risk_value is not None:
+                risk = float(risk_value)
+                if risk >= 50:
+                    risk_item.setForeground(QBrush(QColor(217, 119, 119)))
+                elif risk >= 20:
+                    risk_item.setForeground(QBrush(QColor(216, 181, 106)))
+                else:
+                    risk_item.setForeground(QBrush(QColor(98, 194, 135)))
+
+            self._actions_table.setItem(row, 0, action_item)
+            if action.get("target_grid"):
+                self._actions_table.setCellWidget(row, 1, self._build_target_grid(action))
+            else:
+                self._actions_table.setItem(row, 1, QTableWidgetItem(action.get("target", "")))
+            self._actions_table.setItem(row, 2, risk_item)
+            self._actions_table.setItem(row, 3, why_item)
+            self._actions_table.setItem(row, 4, children_item)
+            self._actions_table.setItem(row, 5, rotate_item)
+
+        self._actions_table.resizeRowsToContents()
+
+
+class PerfectCatPlannerView(QWidget):
+    """Stage-based planner for building perfect 7-base-stat lines."""
+
+    @staticmethod
+    def _set_toggle_button_label(btn: QPushButton, label: str):
+        state = "On" if btn.isChecked() else "Off"
+        btn.setText(f"{label}: {state}")
+
+    @staticmethod
+    def _bind_persistent_toggle(btn: QPushButton, label: str, key: str):
+        PerfectCatPlannerView._set_toggle_button_label(btn, label)
+        btn.toggled.connect(lambda checked: _set_optimizer_flag(key, checked))
+        btn.toggled.connect(lambda _: PerfectCatPlannerView._set_toggle_button_label(btn, label))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+            "QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:3px 6px; }"
+        )
+        self._cats: list[Cat] = []
+        self._excluded_keys: set[int] = set()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        header = QHBoxLayout()
+        self._title = QLabel("Perfect 7 Planner")
+        self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
+        self._summary = QLabel("")
+        self._summary.setStyleSheet("color:#666; font-size:11px;")
+        header.addWidget(self._title)
+        header.addStretch()
+        header.addWidget(self._summary)
+        root.addLayout(header)
+
+        desc = QLabel(
+            "Build a staged plan for pushing toward full 7-base-stat lines without family breeding. "
+            "Use Max inbreeding risk = 0 to force fully clean plans."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#8d8da8; font-size:11px;")
+        root.addWidget(desc)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
+        self._min_stats_label = QLabel("Min base stats:")
+        self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(self._min_stats_label)
+
+        self._min_stats_input = QLineEdit()
+        self._min_stats_input.setPlaceholderText("0")
+        self._min_stats_input.setFixedWidth(60)
+        self._min_stats_input.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        controls.addWidget(self._min_stats_input)
+
+        controls.addSpacing(12)
+
+        self._max_risk_label = QLabel("Max inbreeding risk %:")
+        self._max_risk_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(self._max_risk_label)
+
+        self._max_risk_input = QLineEdit()
+        self._max_risk_input.setPlaceholderText("0")
+        self._max_risk_input.setFixedWidth(60)
+        self._max_risk_input.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        controls.addWidget(self._max_risk_input)
+
+        controls.addSpacing(12)
+
+        starter_label = QLabel("Start pairs:")
+        starter_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(starter_label)
+        self._starter_pairs_input = QSpinBox()
+        self._starter_pairs_input.setRange(1, 12)
+        self._starter_pairs_input.setValue(4)
+        self._starter_pairs_input.setFixedWidth(60)
+        self._starter_pairs_input.setToolTip(
+            "How many unrelated foundation pairs the planner should recommend to start the line."
+        )
+        controls.addWidget(self._starter_pairs_input)
+
+        controls.addSpacing(12)
+
+        stimulation_label = QLabel("Stimulation:")
+        stimulation_label.setStyleSheet("color:#888; font-size:11px;")
+        controls.addWidget(stimulation_label)
+        self._stimulation_input = QSpinBox()
+        self._stimulation_input.setRange(0, 200)
+        self._stimulation_input.setValue(50)
+        self._stimulation_input.setFixedWidth(70)
+        self._stimulation_input.setToolTip(
+            "Used for projected offspring weighting. Higher stimulation favors the stronger parent stat."
+        )
+        controls.addWidget(self._stimulation_input)
+
+        controls.addSpacing(12)
+
+        self._avoid_lovers_checkbox = QPushButton()
+        self._avoid_lovers_checkbox.setCheckable(True)
+        self._avoid_lovers_checkbox.setChecked(_saved_optimizer_flag("perfect_planner_avoid_lovers", False))
+        self._avoid_lovers_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#5a3a2a; color:#ddd; border:1px solid #8a5a4a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._bind_persistent_toggle(self._avoid_lovers_checkbox, "Avoid Lovers", "perfect_planner_avoid_lovers")
+        controls.addWidget(self._avoid_lovers_checkbox)
+
+        self._prefer_low_aggression_checkbox = QPushButton()
+        self._prefer_low_aggression_checkbox.setCheckable(True)
+        self._prefer_low_aggression_checkbox.setChecked(_saved_optimizer_flag("prefer_low_aggression", True))
+        self._prefer_low_aggression_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#4a2a2a; color:#ddd; border:1px solid #7a4a4a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._bind_persistent_toggle(
+            self._prefer_low_aggression_checkbox,
+            "Prefer Low Aggression",
+            "prefer_low_aggression",
+        )
+        controls.addWidget(self._prefer_low_aggression_checkbox)
+
+        self._prefer_high_libido_checkbox = QPushButton()
+        self._prefer_high_libido_checkbox.setCheckable(True)
+        self._prefer_high_libido_checkbox.setChecked(_saved_optimizer_flag("prefer_high_libido", True))
+        self._prefer_high_libido_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#2a4a36; color:#ddd; border:1px solid #4a7a5a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._bind_persistent_toggle(
+            self._prefer_high_libido_checkbox,
+            "Prefer High Libido",
+            "prefer_high_libido",
+        )
+        controls.addWidget(self._prefer_high_libido_checkbox)
+
+        self._plan_btn = QPushButton("Build Perfect 7 Plan")
+        self._plan_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+            "QPushButton:pressed { background:#184b3a; }"
+        )
+        self._plan_btn.clicked.connect(self._calculate_plan)
+        controls.addWidget(self._plan_btn)
+
+        controls.addStretch()
+        root.addLayout(controls)
+
+        self._blacklist_lbl = QLabel("")
+        self._blacklist_lbl.setWordWrap(True)
+        self._blacklist_lbl.setStyleSheet("color:#8d8da8; font-size:11px;")
+        root.addWidget(self._blacklist_lbl)
+
+        self._splitter = QSplitter(Qt.Vertical)
+        self._splitter.setStyleSheet("QSplitter::handle:vertical { background:#1e1e38; }")
+
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels([
+            "Stage", "Goal", "Pairs", "7+ Coverage", "Risk%", "Details",
+        ])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        hh = self._table.horizontalHeader()
+        hh.setStretchLastSection(True)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        hh.setSectionResizeMode(4, QHeaderView.Fixed)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self._table.setColumnWidth(2, 70)
+        self._table.setColumnWidth(3, 95)
+        self._table.setColumnWidth(4, 70)
+        self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self._splitter.addWidget(self._table)
+
+        self._details_pane = PerfectPlannerDetailPanel()
+        self._splitter.addWidget(self._details_pane)
+        self._splitter.setSizes([180, 420])
+        root.addWidget(self._splitter, 1)
+
+        _enforce_min_font_in_widget_tree(self)
+
+    def _on_table_selection_changed(self):
+        selected_ranges = self._table.selectedRanges()
+        if not selected_ranges:
+            self._details_pane.show_stage(None)
+            return
+        row = selected_ranges[0].topRow()
+        stage_item = self._table.item(row, 0)
+        if stage_item:
+            data = stage_item.data(Qt.UserRole)
+            self._details_pane.show_stage(data if isinstance(data, dict) else None)
+
+    def set_cats(self, cats: list[Cat], excluded_keys: set[int] = None):
+        self._cats = cats
+        blacklisted_keys = {c.db_key for c in cats if c.is_blacklisted}
+        self._excluded_keys = (excluded_keys or set()) | blacklisted_keys
+        alive_count = len([c for c in cats if c.status != "Gone"])
+        excluded_count = len([c for c in cats if c.status != "Gone" and c.db_key in self._excluded_keys])
+        if excluded_count > 0:
+            self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
+        else:
+            self._summary.setText(f"{alive_count} alive cats available")
+        blacklisted_names = [f"{c.name} ({c.gender_display})" for c in cats if c.status != "Gone" and c.is_blacklisted]
+        self._blacklist_lbl.setText("Blacklisted: " + (", ".join(blacklisted_names) if blacklisted_names else "none"))
+
+    def _calculate_plan(self):
+        excluded_keys = getattr(self, "_excluded_keys", set())
+        alive_cats = [c for c in self._cats if c.status != "Gone" and c.db_key not in excluded_keys]
+        excluded_cats = [c for c in self._cats if c.status != "Gone" and c.db_key in excluded_keys]
+
+        min_stats = 0
+        try:
+            if self._min_stats_input.text().strip():
+                min_stats = int(self._min_stats_input.text().strip())
+        except ValueError:
+            pass
+
+        max_risk = 0.0
+        try:
+            if self._max_risk_input.text().strip():
+                max_risk = float(self._max_risk_input.text().strip())
+        except ValueError:
+            pass
+
+        starter_pairs = int(self._starter_pairs_input.value())
+        stimulation = float(self._stimulation_input.value())
+        avoid_lovers = self._avoid_lovers_checkbox.isChecked()
+        prefer_low_aggression = self._prefer_low_aggression_checkbox.isChecked()
+        prefer_high_libido = self._prefer_high_libido_checkbox.isChecked()
+
+        if min_stats > 0:
+            alive_cats = [c for c in alive_cats if sum(c.base_stats.values()) >= min_stats]
+
+        if len(alive_cats) < 2:
+            self._table.setRowCount(0)
+            self._details_pane.show_stage(None)
+            self._summary.setText("Not enough cats to build a plan")
+            return
+
+        stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
+        ancestor_paths = {cat.db_key: _ancestor_paths(cat) for cat in alive_cats}
+        parent_key_map = {
+            cat.db_key: {parent.db_key for parent in get_parents(cat)}
+            for cat in alive_cats
+        }
+        hater_key_map = {
+            cat.db_key: {other.db_key for other in getattr(cat, "haters", [])}
+            for cat in alive_cats
+        }
+        lover_key_map = {
+            cat.db_key: {other.db_key for other in getattr(cat, "lovers", [])}
+            for cat in alive_cats
+        }
+        pair_eval_cache: dict[tuple[int, int], tuple[bool, str, float]] = {}
+
+        better_stat_chance = (1.0 + 0.01 * stimulation) / (2.0 + 0.01 * stimulation)
+
+        def _pair_key(cat_a: Cat, cat_b: Cat) -> tuple[int, int]:
+            a_key, b_key = cat_a.db_key, cat_b.db_key
+            return (a_key, b_key) if a_key < b_key else (b_key, a_key)
+
+        def _is_hater_conflict(cat_a: Cat, cat_b: Cat) -> bool:
+            haters_a = hater_key_map.get(cat_a.db_key, set())
+            haters_b = hater_key_map.get(cat_b.db_key, set())
+            return cat_b.db_key in haters_a or cat_a.db_key in haters_b
+
+        def _is_lover_conflict(cat_a: Cat, cat_b: Cat) -> bool:
+            if not avoid_lovers:
+                return False
+            lovers_a = lover_key_map.get(cat_a.db_key, set())
+            lovers_b = lover_key_map.get(cat_b.db_key, set())
+            if lovers_a and cat_b.db_key not in lovers_a:
+                return True
+            if lovers_b and cat_a.db_key not in lovers_b:
+                return True
+            return False
+
+        def _trait_or_default(value: Optional[float], default: float = 0.5) -> float:
+            if value is None:
+                return default
+            return max(0.0, min(1.0, float(value)))
+
+        def _personality_bonus(cat_a: Cat, cat_b: Optional[Cat] = None) -> float:
+            cats = [cat_a] if cat_b is None else [cat_a, cat_b]
+            score = 0.0
+            if prefer_low_aggression:
+                score += sum(1.0 - _trait_or_default(cat.aggression) for cat in cats) / len(cats)
+            if prefer_high_libido:
+                score += sum(_trait_or_default(cat.libido) for cat in cats) / len(cats)
+            return score
+
+        def _is_direct_family_pair(cat_a: Cat, cat_b: Cat) -> bool:
+            parents_a = parent_key_map.get(cat_a.db_key, set())
+            parents_b = parent_key_map.get(cat_b.db_key, set())
+            if cat_a.db_key in parents_b or cat_b.db_key in parents_a:
+                return True
+            return bool(parents_a & parents_b)
+
+        def _pair_eval(cat_a: Cat, cat_b: Cat) -> tuple[bool, str, float]:
+            key = _pair_key(cat_a, cat_b)
+            cached = pair_eval_cache.get(key)
+            if cached is not None:
+                return cached
+            ok, reason = can_breed(cat_a, cat_b)
+            if ok and _is_direct_family_pair(cat_a, cat_b):
+                ok = False
+                reason = "Direct family pair"
+            if ok and _is_hater_conflict(cat_a, cat_b):
+                ok = False
+                reason = "These cats hate each other"
+            if ok and _is_lover_conflict(cat_a, cat_b):
+                ok = False
+                reason = "One or both cats already have a lover"
+            if ok:
+                pa = ancestor_paths.get(cat_a.db_key) or {}
+                pb = ancestor_paths.get(cat_b.db_key) or {}
+                risk = max(0.0, min(100.0, (_raw_coi_from_paths(pa, pb) / 0.25) * 100.0))
+            else:
+                risk = 0.0
+            pair_eval_cache[key] = (ok, reason, risk)
+            return pair_eval_cache[key]
+
+        def _offspring_projection(cat_a: Cat, cat_b: Cat) -> dict:
+            expected_stats: dict[str, float] = {}
+            stat_ranges: dict[str, tuple[int, int]] = {}
+            locked_stats: list[str] = []
+            reachable_stats: list[str] = []
+            missing_stats: list[str] = []
+            seven_plus_total = 0.0
+            distance_total = 0.0
+            for stat in STAT_NAMES:
+                stat_a = cat_a.base_stats[stat]
+                stat_b = cat_b.base_stats[stat]
+                lo = min(stat_a, stat_b)
+                hi = max(stat_a, stat_b)
+                stat_ranges[stat] = (lo, hi)
+                expected = hi * better_stat_chance + lo * (1.0 - better_stat_chance)
+                expected_stats[stat] = expected
+                distance_total += abs(expected - 7.0)
+                if lo >= 7:
+                    locked_stats.append(stat)
+                    reachable_stats.append(stat)
+                    seven_plus_total += 1.0
+                elif hi >= 7:
+                    reachable_stats.append(stat)
+                    seven_plus_total += better_stat_chance
+                else:
+                    missing_stats.append(stat)
+            sum_lo = sum(lo for lo, _ in stat_ranges.values())
+            sum_hi = sum(hi for _, hi in stat_ranges.values())
+            avg_expected = sum(expected_stats.values()) / len(STAT_NAMES)
+            return {
+                "expected_stats": expected_stats,
+                "stat_ranges": stat_ranges,
+                "locked_stats": locked_stats,
+                "reachable_stats": reachable_stats,
+                "missing_stats": missing_stats,
+                "seven_plus_total": seven_plus_total,
+                "distance_total": distance_total,
+                "sum_range": (sum_lo, sum_hi),
+                "avg_expected": avg_expected,
+            }
+
+        candidate_pairs: list[tuple[Cat, Cat]] = []
+        males = [c for c in alive_cats if c.gender == "male"]
+        females = [c for c in alive_cats if c.gender == "female"]
+        unknown = [c for c in alive_cats if c.gender == "?"]
+        candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in females)
+        candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in unknown)
+        candidate_pairs.extend((cat_a, cat_b) for cat_a in females for cat_b in unknown)
+        for i, cat_a in enumerate(unknown):
+            for cat_b in unknown[i + 1:]:
+                candidate_pairs.append((cat_a, cat_b))
+
+        evaluated_pairs = []
+        for cat_a, cat_b in candidate_pairs:
+            ok, _, risk = _pair_eval(cat_a, cat_b)
+            if not ok or risk > max_risk:
+                continue
+
+            projection = _offspring_projection(cat_a, cat_b)
+            founder_bonus = sum(1.0 for cat in (cat_a, cat_b) if not get_parents(cat)) * 2.0
+            must_breed_bonus = 3.0 if cat_a.must_breed or cat_b.must_breed else 0.0
+            personality = _personality_bonus(cat_a, cat_b) * 3.0
+            progress_score = (
+                projection["seven_plus_total"] * 16.0
+                + len(projection["locked_stats"]) * 12.0
+                + len(projection["reachable_stats"]) * 6.0
+                - len(projection["missing_stats"]) * 7.0
+                - projection["distance_total"] * 2.5
+                - risk * 1.2
+                + founder_bonus
+                + personality
+                + must_breed_bonus
+            )
+
+            evaluated_pairs.append({
+                "cat_a": cat_a,
+                "cat_b": cat_b,
+                "risk": risk,
+                "projection": projection,
+                "score": progress_score,
+                "personality": personality,
+            })
+
+        evaluated_pairs.sort(
+            key=lambda pair: (
+                pair["projection"]["seven_plus_total"],
+                len(pair["projection"]["locked_stats"]),
+                pair["score"],
+                stat_sum[pair["cat_a"].db_key] + stat_sum[pair["cat_b"].db_key],
+            ),
+            reverse=True,
+        )
+
+        selected_pairs = []
+        used_keys: set[int] = set()
+        for pair in evaluated_pairs:
+            cat_a = pair["cat_a"]
+            cat_b = pair["cat_b"]
+            if cat_a.db_key in used_keys or cat_b.db_key in used_keys:
+                continue
+            selected_pairs.append(pair)
+            used_keys.add(cat_a.db_key)
+            used_keys.add(cat_b.db_key)
+            if len(selected_pairs) >= starter_pairs:
+                break
+
+        if not selected_pairs:
+            self._table.setRowCount(0)
+            self._details_pane.show_stage(None)
+            self._summary.setText("No low-risk unrelated breeding pairs found under the current filters")
+            return
+
+        def _fmt_stats(stats: list[str]) -> str:
+            return ", ".join(stats) if stats else "none"
+
+        def _pair_name(pair: dict) -> str:
+            return f"{pair['cat_a'].name} ({pair['cat_a'].gender_display}) x {pair['cat_b'].name} ({pair['cat_b'].gender_display})"
+
+        def _stage1_target_grid(pair: dict) -> dict:
+            projection = pair["projection"]
+            return {
+                "parents": [
+                    {
+                        "name": f"{pair['cat_a'].name}\n{pair['cat_a'].gender_display}",
+                        "stats": pair["cat_a"].base_stats,
+                        "sum": sum(pair["cat_a"].base_stats.values()),
+                    },
+                    {
+                        "name": f"{pair['cat_b'].name}\n{pair['cat_b'].gender_display}",
+                        "stats": pair["cat_b"].base_stats,
+                        "sum": sum(pair["cat_b"].base_stats.values()),
+                    },
+                ],
+                "offspring": {
+                    "stats": {
+                        stat: {
+                            "lo": projection["stat_ranges"][stat][0],
+                            "hi": projection["stat_ranges"][stat][1],
+                            "expected": projection["expected_stats"][stat],
+                        }
+                        for stat in STAT_NAMES
+                    },
+                    "sum_range": projection["sum_range"],
+                },
+            }
+
+        def _planner_pair_grid(cat_a: Cat, cat_b: Cat, projection: dict) -> dict:
+            return {
+                "parents": [
+                    {
+                        "name": f"{cat_a.name}\n{cat_a.gender_display}",
+                        "stats": cat_a.base_stats,
+                        "sum": sum(cat_a.base_stats.values()),
+                    },
+                    {
+                        "name": f"{cat_b.name}\n{cat_b.gender_display}",
+                        "stats": cat_b.base_stats,
+                        "sum": sum(cat_b.base_stats.values()),
+                    },
+                ],
+                "offspring": {
+                    "stats": {
+                        stat: {
+                            "lo": projection["stat_ranges"][stat][0],
+                            "hi": projection["stat_ranges"][stat][1],
+                            "expected": projection["expected_stats"][stat],
+                        }
+                        for stat in STAT_NAMES
+                    },
+                    "sum_range": projection["sum_range"],
+                },
+            }
+
+        def _rotation_candidate(pair: dict) -> Optional[dict]:
+            missing_stats = pair["projection"]["missing_stats"]
+            if not missing_stats:
+                return None
+            best = None
+            pair_cats = {pair["cat_a"].db_key, pair["cat_b"].db_key}
+            for parent in (pair["cat_a"], pair["cat_b"]):
+                for candidate in alive_cats:
+                    if candidate.db_key in pair_cats:
+                        continue
+                    ok, _, risk = _pair_eval(parent, candidate)
+                    if not ok or risk > max_risk:
+                        continue
+                    bring_stats = [stat for stat in missing_stats if candidate.base_stats[stat] >= 7]
+                    if not bring_stats:
+                        continue
+                    score = (
+                        len(bring_stats) * 15.0
+                        + sum(candidate.base_stats[stat] for stat in bring_stats)
+                        - risk
+                        + _personality_bonus(parent, candidate) * 3.0
+                        + (4.0 if not get_parents(candidate) else 0.0)
+                    )
+                    record = {
+                        "parent": parent,
+                        "candidate": candidate,
+                        "risk": risk,
+                        "bring_stats": bring_stats,
+                        "score": score,
+                    }
+                    if best is None or record["score"] > best["score"]:
+                        best = record
+            return best
+
+        stage_rows: list[dict] = []
+
+        stage1_actions = []
+        for idx, pair in enumerate(selected_pairs, 1):
+            projection = pair["projection"]
+            stage1_actions.append({
+                "action": f"Pair {idx}",
+                "target": _pair_name(pair),
+                "target_grid": _stage1_target_grid(pair),
+                "risk": pair["risk"],
+                "why": (
+                    f"Fast foundation pair for a perfect-7 line. "
+                    f"Projected 7+ coverage: {projection['seven_plus_total']:.1f}/7 at stimulation {int(stimulation)}. "
+                    f"Locks: {_fmt_stats(projection['locked_stats'])}. "
+                    f"Can hit 7: {_fmt_stats([s for s in projection['reachable_stats'] if s not in projection['locked_stats']])}. "
+                    f"Still below 7: {_fmt_stats(projection['missing_stats'])}."
+                ),
+                "children": (
+                    "Keep the strongest son and daughter if possible. "
+                    "Do not reuse siblings together."
+                ),
+                "rotate": (
+                    "Stay on this pair until the line stops improving, then use the Stage 3 outcross."
+                ),
+            })
+
+        stage_rows.append({
+            "stage": "Stage 1",
+            "goal": f"Start with {len(selected_pairs)} foundation pairs",
+            "pairs": len(selected_pairs),
+            "coverage": sum(pair["projection"]["seven_plus_total"] for pair in selected_pairs) / len(selected_pairs),
+            "risk": max(pair["risk"] for pair in selected_pairs),
+            "details": "Best unrelated pairs to start pushing 7s immediately",
+            "summary": (
+                f"Start with {len(selected_pairs)} unrelated foundation pairs. "
+                "These are the fastest low-risk lines for reaching full 7-base-stat coverage."
+            ),
+            "notes": [
+                "Foundation pairs are disjoint so you can work multiple lines at once.",
+                "Max inbreeding risk is enforced before a pair can appear here.",
+            ],
+            "actions": stage1_actions,
+        })
+
+        stage2_actions = []
+        for idx, pair in enumerate(selected_pairs, 1):
+            projection = pair["projection"]
+            stage2_actions.append({
+                "action": f"Separate Pair {idx} offspring",
+                "target": f"Protect locked stats: {_fmt_stats(projection['locked_stats'])}",
+                "risk": None,
+                "why": (
+                    "Keeping sons and daughters apart preserves multiple clean branches "
+                    "instead of collapsing into sibling breeding."
+                ),
+                "children": (
+                    f"Move Pair {idx} sons and daughters into different rooms from each other and from "
+                    f"{pair['cat_a'].name} / {pair['cat_b'].name} once they mature."
+                ),
+                "rotate": (
+                    "Choose one keeper line per sex, then hold the backups aside for future outcrosses."
+                ),
+            })
+
+        stage_rows.append({
+            "stage": "Stage 2",
+            "goal": "Separate children into future lines",
+            "pairs": len(stage2_actions),
+            "coverage": sum(len(pair["projection"]["locked_stats"]) for pair in selected_pairs) / len(selected_pairs),
+            "risk": 0.0,
+            "details": "Room guidance to avoid collapsing the plan into sibling loops",
+            "summary": (
+                "Separate offspring by line and sex. The planner assumes you will keep clean branches "
+                "available for the next generation instead of breeding within one family."
+            ),
+            "notes": [
+                "This stage is the child-separation guidance from issue #19.",
+                "If you only keep one kitten, keep the one that raises the lowest missing stat.",
+            ],
+            "actions": stage2_actions,
+        })
+
+        stage3_actions = []
+        stage3_import_counts: list[float] = []
+        for idx, pair in enumerate(selected_pairs, 1):
+            rotation = _rotation_candidate(pair)
+            missing = pair["projection"]["missing_stats"]
+            if rotation is None:
+                stage3_import_counts.append(0.0)
+                stage3_actions.append({
+                    "action": f"Rotate Pair {idx} later",
+                    "target": f"Still missing: {_fmt_stats(missing)}",
+                    "risk": None,
+                    "why": (
+                        "No clean outcross in the current roster covers the missing stats under the active risk cap."
+                    ),
+                    "children": (
+                        "Keep the best backup kitten alive and wait for an unrelated stray or future outcross."
+                    ),
+                    "rotate": (
+                        f"Bring in a stray/unrelated breeder with 7s in {_fmt_stats(missing)}."
+                    ),
+                })
+            else:
+                source_note = "founder line" if not get_parents(rotation["candidate"]) else "existing line"
+                rotated_projection = _offspring_projection(rotation["parent"], rotation["candidate"])
+                stage3_import_counts.append(float(len(rotation["bring_stats"])))
+                stage3_actions.append({
+                    "action": f"Pair {idx} Rotation",
+                    "target": (
+                        f"{rotation['parent'].name} ({rotation['parent'].gender_display}) x "
+                        f"{rotation['candidate'].name} ({rotation['candidate'].gender_display})"
+                    ),
+                    "target_grid": _planner_pair_grid(
+                        rotation["parent"],
+                        rotation["candidate"],
+                        rotated_projection,
+                    ),
+                    "risk": rotation["risk"],
+                    "why": (
+                        f"Use this {source_note} outcross when Pair {idx} stalls on {_fmt_stats(missing)}. "
+                        f"It covers missing 7-stats without falling back to family breeding. "
+                        f"Projected 7+ coverage: {rotated_projection['seven_plus_total']:.1f}/7 at stimulation {int(stimulation)}. "
+                        f"Locks: {_fmt_stats(rotated_projection['locked_stats'])}. "
+                        f"Can hit 7: {_fmt_stats([s for s in rotated_projection['reachable_stats'] if s not in rotated_projection['locked_stats']])}. "
+                        f"Still below 7: {_fmt_stats(rotated_projection['missing_stats'])}."
+                    ),
+                    "children": (
+                        "Promote the kitten that keeps the old locked stats while adding the missing stat coverage."
+                    ),
+                    "rotate": (
+                        "Swap once the current line stops improving or when siblings would be your next obvious match."
+                    ),
+                })
+
+        stage_rows.append({
+            "stage": "Stage 3",
+            "goal": "Rotate partners before the line stalls",
+            "pairs": len(stage3_actions),
+            "coverage": sum(stage3_import_counts) / max(1, len(stage3_import_counts)),
+            "risk": max(
+                [float(action["risk"]) for action in stage3_actions if action["risk"] is not None] or [0.0]
+            ),
+            "details": "When and why to outcross instead of breeding inward",
+            "summary": (
+                "Rotate into unrelated or lower-risk partners when a line is missing specific 7s. "
+                "This is the long-term maintenance step from issue #26."
+            ),
+            "notes": [
+                "Rotation advice is based on the missing 7-stat coverage from each foundation pair.",
+                "If no candidate appears, the roster is telling you to wait for a cleaner founder.",
+            ],
+            "actions": stage3_actions,
+        })
+
+        stage4_actions = []
+        for idx, pair in enumerate(selected_pairs, 1):
+            missing = pair["projection"]["missing_stats"]
+            if missing:
+                stage4_actions.append({
+                    "action": f"Finish Pair {idx} through a keeper outcross",
+                    "target": f"Finish: {_fmt_stats(missing)}",
+                    "risk": pair["risk"],
+                    "why": (
+                        "Once a keeper from this line is close to all 7s, use the Stage 3 rotation target rather "
+                        "than breeding back into siblings or parents."
+                    ),
+                    "children": (
+                        "Keep one opposite-sex backup in a different room so the finished line survives bad rolls."
+                    ),
+                    "rotate": (
+                        "Retire the weaker branch once the new keeper strictly improves the missing stats."
+                    ),
+                })
+            else:
+                stage4_actions.append({
+                    "action": f"Maintain Pair {idx} as a clean 7-line",
+                    "target": "All seven stats already covered",
+                    "risk": pair["risk"],
+                    "why": (
+                        "This line already covers every target stat. The goal shifts from climbing to preserving."
+                    ),
+                    "children": (
+                        "Keep a primary breeder and a backup of the opposite sex in separate rooms."
+                    ),
+                    "rotate": (
+                        "Only bring in an unrelated stray if you need redundancy or the risk cap tightens."
+                    ),
+                })
+
+        stage_rows.append({
+            "stage": "Stage 4",
+            "goal": "Maintain and finish the strongest lines",
+            "pairs": len(stage4_actions),
+            "coverage": sum(len(pair["projection"]["reachable_stats"]) for pair in selected_pairs) / len(selected_pairs),
+            "risk": max(pair["risk"] for pair in selected_pairs),
+            "details": "How to convert the strongest keeper lines into durable perfect cats",
+            "summary": (
+                "Use the strongest keepers to finish the line, then preserve it with unrelated backups instead "
+                "of letting the plan collapse into inbred maintenance."
+            ),
+            "notes": [
+                "The planner is optimizing toward perfect 7-base-stat coverage, not short-term room fill.",
+                "Set Max inbreeding risk to 0 for the cleanest possible plan.",
+            ],
+            "actions": stage4_actions,
+        })
+
+        self._table.setRowCount(0)
+        self._details_pane.show_stage(None)
+
+        for row_idx, stage in enumerate(stage_rows):
+            self._table.insertRow(row_idx)
+            stage_item = QTableWidgetItem(stage["stage"])
+            stage_item.setData(Qt.UserRole, stage)
+            stage_item.setTextAlignment(Qt.AlignCenter)
+
+            goal_item = QTableWidgetItem(stage["goal"])
+            pair_item = QTableWidgetItem(str(stage["pairs"]))
+            pair_item.setTextAlignment(Qt.AlignCenter)
+
+            coverage_value = float(stage["coverage"])
+            coverage_item = QTableWidgetItem(f"{coverage_value:.1f}/7")
+            coverage_item.setTextAlignment(Qt.AlignCenter)
+            if coverage_value >= 6.0:
+                coverage_item.setForeground(QBrush(QColor(98, 194, 135)))
+            elif coverage_value >= 4.5:
+                coverage_item.setForeground(QBrush(QColor(216, 181, 106)))
+            else:
+                coverage_item.setForeground(QBrush(QColor(190, 145, 40)))
+
+            risk_value = float(stage["risk"])
+            risk_item = QTableWidgetItem(f"{risk_value:.0f}%")
+            risk_item.setTextAlignment(Qt.AlignCenter)
+            if risk_value >= 20:
+                risk_item.setForeground(QBrush(QColor(217, 119, 119)))
+            elif risk_value > 0:
+                risk_item.setForeground(QBrush(QColor(216, 181, 106)))
+            else:
+                risk_item.setForeground(QBrush(QColor(98, 194, 135)))
+
+            details_item = QTableWidgetItem(stage["details"])
+
+            self._table.setItem(row_idx, 0, stage_item)
+            self._table.setItem(row_idx, 1, goal_item)
+            self._table.setItem(row_idx, 2, pair_item)
+            self._table.setItem(row_idx, 3, coverage_item)
+            self._table.setItem(row_idx, 4, risk_item)
+            self._table.setItem(row_idx, 5, details_item)
+
+        if excluded_cats:
+            self._summary.setText(
+                f"Planned {len(selected_pairs)} starting pairs from {len(alive_cats)} eligible cats "
+                f"({len(excluded_cats)} excluded)"
+            )
+        else:
+            self._summary.setText(
+                f"Planned {len(selected_pairs)} starting pairs from {len(alive_cats)} eligible cats"
+            )
+
+        if stage_rows:
+            self._table.selectRow(0)
+            self._details_pane.show_stage(stage_rows[0])
+
+
 # ── Sidebar helpers ───────────────────────────────────────────────────────────
 
 
@@ -5502,6 +6494,7 @@ class MainWindow(QMainWindow):
         self._safe_breeding_view: Optional[SafeBreedingView] = None
         self._breeding_partners_view: Optional[BreedingPartnersView] = None
         self._room_optimizer_view: Optional[RoomOptimizerView] = None
+        self._perfect_planner_view: Optional[PerfectCatPlannerView] = None
         self._calibration_view: Optional[CalibrationView] = None
         self._zoom_percent: int = 100
         self._base_font: QFont = QApplication.instance().font()
@@ -5773,6 +6766,9 @@ class MainWindow(QMainWindow):
         self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
         self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
         vb.addWidget(self._btn_room_optimizer)
+        self._btn_perfect_planner = _sidebar_btn("Perfect 7 Planner")
+        self._btn_perfect_planner.clicked.connect(self._open_perfect_planner_view)
+        vb.addWidget(self._btn_perfect_planner)
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
         self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
         vb.addWidget(self._btn_safe_breeding_view)
@@ -6003,6 +6999,9 @@ class MainWindow(QMainWindow):
         self._room_optimizer_view = RoomOptimizerView(self)
         self._room_optimizer_view.hide()
         vb.addWidget(self._room_optimizer_view, 1)
+        self._perfect_planner_view = PerfectCatPlannerView(self)
+        self._perfect_planner_view.hide()
+        vb.addWidget(self._perfect_planner_view, 1)
         self._calibration_view = CalibrationView(self)
         self._calibration_view.calibrationChanged.connect(self._on_calibration_changed)
         self._calibration_view.hide()
@@ -6069,6 +7068,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
         if hasattr(self, "_header"):
@@ -6083,6 +7084,8 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
 
@@ -6100,6 +7103,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
         if self._tree_view is not None:
@@ -6113,6 +7118,8 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
 
@@ -6130,6 +7137,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
         if self._safe_breeding_view is not None:
@@ -6143,6 +7152,8 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
 
@@ -6192,6 +7203,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
             self._room_optimizer_view.show()
@@ -6203,6 +7216,42 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(True)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
+        if hasattr(self, "_btn_calibration"):
+            self._btn_calibration.setChecked(False)
+
+    def _show_perfect_planner_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
+        if hasattr(self, "_calibration_view") and self._calibration_view is not None:
+            self._calibration_view.hide()
+        if self._perfect_planner_view is not None:
+            self._perfect_planner_view.set_cats(self._cats)
+            self._perfect_planner_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(True)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
 
@@ -6222,6 +7271,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.hide()
         if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
             self._room_optimizer_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
         if self._calibration_view is not None:
             if self._current_save:
                 self._calibration_view.set_context(self._current_save, self._cats)
@@ -6234,6 +7285,8 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(False)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(True)
 
@@ -6270,6 +7323,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.set_cats(self._cats)
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
+        if self._perfect_planner_view is not None:
+            self._perfect_planner_view.set_cats(self._cats)
 
     def _on_calibration_changed(self):
         if not self._current_save:
@@ -6282,6 +7337,8 @@ class MainWindow(QMainWindow):
             self._breeding_partners_view.set_cats(self._cats)
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
+        if self._perfect_planner_view is not None:
+            self._perfect_planner_view.set_cats(self._cats)
         if self._calibration_view is not None and self._calibration_view.isVisible():
             self._calibration_view.set_context(self._current_save, self._cats)
         self._update_count()
@@ -6324,6 +7381,8 @@ class MainWindow(QMainWindow):
                 self._breeding_partners_view.set_cats(cats)
             if self._room_optimizer_view is not None:
                 self._room_optimizer_view.set_cats(cats)
+            if self._perfect_planner_view is not None:
+                self._perfect_planner_view.set_cats(cats)
             if self._calibration_view is not None:
                 self._calibration_view.set_context(path, cats)
 
@@ -6394,6 +7453,9 @@ class MainWindow(QMainWindow):
 
     def _open_room_optimizer(self):
         self._show_room_optimizer_view()
+
+    def _open_perfect_planner_view(self):
+        self._show_perfect_planner_view()
 
     def _open_calibration_view(self):
         self._show_calibration_view()
