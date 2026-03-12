@@ -3817,6 +3817,11 @@ class BreedingPartnersView(QWidget):
 class RoomOptimizerView(QWidget):
     """View for optimizing cat room distribution to maximize breeding outcomes."""
 
+    @staticmethod
+    def _set_toggle_button_label(btn: QPushButton, label: str):
+        state = "On" if btn.isChecked() else "Off"
+        btn.setText(f"{label}: {state}")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(
@@ -3898,7 +3903,7 @@ class RoomOptimizerView(QWidget):
 
         controls.addSpacing(8)
 
-        self._minimize_variance_checkbox = QPushButton("Minimize Variance")
+        self._minimize_variance_checkbox = QPushButton()
         self._minimize_variance_checkbox.setCheckable(True)
         self._minimize_variance_checkbox.setChecked(False)
         self._minimize_variance_checkbox.setStyleSheet(
@@ -3907,9 +3912,13 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#2a4a5a; color:#ddd; border:1px solid #4a6a7a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
+        self._set_toggle_button_label(self._minimize_variance_checkbox, "Minimize Variance")
+        self._minimize_variance_checkbox.toggled.connect(
+            lambda _: self._set_toggle_button_label(self._minimize_variance_checkbox, "Minimize Variance")
+        )
         controls.addWidget(self._minimize_variance_checkbox)
 
-        self._avoid_lovers_checkbox = QPushButton("Avoid Lovers")
+        self._avoid_lovers_checkbox = QPushButton()
         self._avoid_lovers_checkbox.setCheckable(True)
         self._avoid_lovers_checkbox.setChecked(False)
         self._avoid_lovers_checkbox.setToolTip(
@@ -3921,10 +3930,56 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#5a3a2a; color:#ddd; border:1px solid #8a5a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
+        self._set_toggle_button_label(self._avoid_lovers_checkbox, "Avoid Lovers")
+        self._avoid_lovers_checkbox.toggled.connect(
+            lambda _: self._set_toggle_button_label(self._avoid_lovers_checkbox, "Avoid Lovers")
+        )
         controls.addWidget(self._avoid_lovers_checkbox)
+
+        self._prefer_low_aggression_checkbox = QPushButton()
+        self._prefer_low_aggression_checkbox.setCheckable(True)
+        self._prefer_low_aggression_checkbox.setChecked(False)
+        self._prefer_low_aggression_checkbox.setToolTip(
+            "If enabled, optimizer gives extra weight to lower-aggression cats."
+        )
+        self._prefer_low_aggression_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#4a2a2a; color:#ddd; border:1px solid #7a4a4a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._set_toggle_button_label(self._prefer_low_aggression_checkbox, "Prefer Low Aggression")
+        self._prefer_low_aggression_checkbox.toggled.connect(
+            lambda _: self._set_toggle_button_label(self._prefer_low_aggression_checkbox, "Prefer Low Aggression")
+        )
+        controls.addWidget(self._prefer_low_aggression_checkbox)
+
+        self._prefer_high_libido_checkbox = QPushButton()
+        self._prefer_high_libido_checkbox.setCheckable(True)
+        self._prefer_high_libido_checkbox.setChecked(False)
+        self._prefer_high_libido_checkbox.setToolTip(
+            "If enabled, optimizer gives extra weight to higher-libido cats."
+        )
+        self._prefer_high_libido_checkbox.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:checked { background:#2a4a36; color:#ddd; border:1px solid #4a7a5a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._set_toggle_button_label(self._prefer_high_libido_checkbox, "Prefer High Libido")
+        self._prefer_high_libido_checkbox.toggled.connect(
+            lambda _: self._set_toggle_button_label(self._prefer_high_libido_checkbox, "Prefer High Libido")
+        )
+        controls.addWidget(self._prefer_high_libido_checkbox)
 
         self._optimize_btn = QPushButton("Calculate Optimal Distribution")
         self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
+        self._optimize_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+            "QPushButton:pressed { background:#184b3a; }"
+        )
         controls.addWidget(self._optimize_btn)
 
         controls.addStretch()
@@ -3968,7 +4023,7 @@ class RoomOptimizerView(QWidget):
         # Details pane
         self._details_pane = RoomOptimizerDetailPanel()
         self._splitter.addWidget(self._details_pane)
-        self._splitter.setSizes([400, 200])
+        self._splitter.setSizes([180, 420])
 
         root.addWidget(self._splitter, 1)
 
@@ -4041,6 +4096,8 @@ class RoomOptimizerView(QWidget):
         # Get minimize variance option
         minimize_variance = self._minimize_variance_checkbox.isChecked()
         avoid_lovers = self._avoid_lovers_checkbox.isChecked()
+        prefer_low_aggression = self._prefer_low_aggression_checkbox.isChecked()
+        prefer_high_libido = self._prefer_high_libido_checkbox.isChecked()
 
         # Filter cats by minimum stats
         if min_stats > 0:
@@ -4076,6 +4133,20 @@ class RoomOptimizerView(QWidget):
             lovers_a = lover_key_map.get(cat_a.db_key, set())
             lovers_b = lover_key_map.get(cat_b.db_key, set())
             return cat_b.db_key in lovers_a and cat_a.db_key in lovers_b
+
+        def _trait_or_default(value: Optional[float], default: float = 0.5) -> float:
+            if value is None:
+                return default
+            return max(0.0, min(1.0, float(value)))
+
+        def _personality_score(cat_a: Cat, cat_b: Optional[Cat] = None) -> float:
+            cats = [cat_a] if cat_b is None else [cat_a, cat_b]
+            score = 0.0
+            if prefer_low_aggression:
+                score += sum(1.0 - _trait_or_default(cat.aggression) for cat in cats) / len(cats)
+            if prefer_high_libido:
+                score += sum(_trait_or_default(cat.libido) for cat in cats) / len(cats)
+            return score
 
         def _is_lover_conflict(cat_a: Cat, cat_b: Cat) -> bool:
             if not avoid_lovers:
@@ -4220,7 +4291,7 @@ class RoomOptimizerView(QWidget):
                                 lover_bonus = 0.0 if avoid_lovers else sum(
                                     1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)
                                 ) * 1000.0
-                                score = lover_bonus - avg_risk
+                                score = lover_bonus - avg_risk + _personality_score(cat)
                                 if score > best_score:
                                     best_score = score
                                     best_room = room
@@ -4260,7 +4331,7 @@ class RoomOptimizerView(QWidget):
                             lover_bonus = 0.0 if avoid_lovers else sum(
                                 1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)
                             ) * 1000.0
-                            score = lover_bonus - avg_risk
+                            score = lover_bonus - avg_risk + _personality_score(cat)
                             if score > best_score:
                                 best_score = score
                                 best_room = room
@@ -4323,7 +4394,12 @@ class RoomOptimizerView(QWidget):
                             if gap > 2:
                                 variance_penalty += gap * 2.0
 
-                    quality = (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0) - variance_penalty
+                    personality_bonus = _personality_score(cat_a, cat_b) * 2.5
+                    quality = (
+                        (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0)
+                        - variance_penalty
+                        + personality_bonus
+                    )
 
                     # Boost quality for must-breed cats
                     must_breed_bonus = 0
@@ -4340,6 +4416,7 @@ class RoomOptimizerView(QWidget):
                         'quality': quality,
                         'must_breed_bonus': must_breed_bonus,
                         'lover_bonus': lover_bonus,
+                        'personality_bonus': personality_bonus,
                     })
 
             # Sort with must-breed pairs first, then mutual lovers, then by quality.
@@ -4583,6 +4660,12 @@ class RoomOptimizerView(QWidget):
             filter_info.append(f"max risk: {max_risk}%")
         if (not mode_family) and minimize_variance:
             filter_info.append("variance: on")
+        if prefer_low_aggression:
+            filter_info.append("prefer low aggression")
+        if prefer_high_libido:
+            filter_info.append("prefer high libido")
+        if avoid_lovers:
+            filter_info.append("avoid lovers")
 
         filter_str = f"  |  Filters: {', '.join(filter_info)}" if filter_info else ""
 
@@ -4602,6 +4685,7 @@ class RoomOptimizerDetailPanel(QWidget):
 
         self._summary = QLabel("Select a room to see pair details.")
         self._summary.setStyleSheet("color:#aaa; font-size:12px;")
+        self._summary.setWordWrap(True)
         root.addWidget(self._summary)
 
         self._pairs_table = QTableWidget(0, 12)
@@ -4656,6 +4740,7 @@ class RoomOptimizerDetailPanel(QWidget):
     def show_room(self, data: Optional[dict]):
         if not data:
             self._summary.setText("Select a room to see pair details.")
+            self._summary.setToolTip("")
             self._pairs_table.setRowCount(0)
             return
 
@@ -4667,12 +4752,27 @@ class RoomOptimizerDetailPanel(QWidget):
         pairs = data.get("pairs", [])
         excluded_cats = data.get("excluded_cats", [])
 
+        def _compact_names(names: list[str], limit: int = 8) -> str:
+            if len(names) <= limit:
+                return ", ".join(names)
+            shown = ", ".join(names[:limit])
+            return f"{shown}, ... (+{len(names) - limit} more)"
+
+        cats_text = _compact_names(cats)
+        excluded_text = _compact_names(excluded_cats)
+        tooltip_parts = []
+        if cats:
+            tooltip_parts.append("Cats: " + ", ".join(cats))
+        if excluded_cats:
+            tooltip_parts.append("Excluded: " + ", ".join(excluded_cats))
+
         self._summary.setText(
-            f"{room}  |  Cats: {', '.join(cats)}  |  "
+            f"{room}  |  Cats: {cats_text}  |  "
             f"Pairs: {total_pairs}  |  Avg offspring stats: {avg_stats:.1f}  |  Avg inbred risk: {avg_risk:.0f}%"
         )
         if excluded_cats:
-            self._summary.setText(self._summary.text() + f"  |  Excluded: {', '.join(excluded_cats)}")
+            self._summary.setText(self._summary.text() + f"  |  Excluded: {excluded_text}")
+        self._summary.setToolTip("\n".join(tooltip_parts))
 
         self._pairs_table.setRowCount(len(pairs))
         for i, pair in enumerate(pairs, 1):
