@@ -533,6 +533,22 @@ def _set_save_dir(path: str):
     data["save_dir"] = cleaned
     _save_app_config(data)
 
+
+def _saved_optimizer_flag(name: str, default: bool = False) -> bool:
+    data = _load_app_config()
+    value = data.get("optimizer_flags", {}).get(name, default)
+    return bool(value)
+
+
+def _set_optimizer_flag(name: str, value: bool):
+    data = _load_app_config()
+    flags = data.get("optimizer_flags")
+    if not isinstance(flags, dict):
+        flags = {}
+    flags[name] = bool(value)
+    data["optimizer_flags"] = flags
+    _save_app_config(data)
+
 _STAT_LABELS = {
     "str": "STR",
     "con": "CON",
@@ -1532,6 +1548,10 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
     return False, "Cats have incompatible genders — cannot produce offspring"
 
 
+def _is_hater_pair(a: 'Cat', b: 'Cat') -> bool:
+    return b in getattr(a, 'haters', []) or a in getattr(b, 'haters', [])
+
+
 # ── Compatibility check ───────────────────────────────────────────────────────
 
 def _compatibility(focus: 'Cat', other: 'Cat') -> str:
@@ -1545,7 +1565,7 @@ def _compatibility(focus: 'Cat', other: 'Cat') -> str:
     if not ok:
         return 'incompatible'
     # Hate relationship
-    if other in getattr(focus, 'haters', []) or focus in getattr(other, 'haters', []):
+    if _is_hater_pair(focus, other):
         return 'incompatible'
     # Direct parent/offspring
     if focus in get_parents(other) or other in get_parents(focus):
@@ -1899,6 +1919,24 @@ def _trait_label_from_value(field: str, value) -> str:
             return "slightly"
         return "moderately"
     return ""
+
+
+_TRAIT_LEVEL_COLORS = {
+    "low": QColor(70, 150, 90),
+    "not": QColor(70, 150, 90),
+    "average": QColor(185, 145, 60),
+    "slightly": QColor(185, 145, 60),
+    "high": QColor(175, 80, 80),
+    "moderately": QColor(175, 80, 80),
+    "low to average": QColor(128, 148, 74),
+    "average to high": QColor(180, 112, 70),
+    "not to slightly": QColor(128, 148, 74),
+    "slightly to moderately": QColor(180, 112, 70),
+}
+
+
+def _trait_level_color(text: str) -> QColor:
+    return _TRAIT_LEVEL_COLORS.get(str(text or "").strip().lower(), QColor(80, 80, 95))
 
 
 def _load_calibration_data(save_path: str) -> dict:
@@ -2327,6 +2365,18 @@ class CatTableModel(QAbstractTableModel):
                 if compat == 'risky':
                     return QBrush(QColor(sc.red() // 2, sc.green() // 2, sc.blue() // 2))
                 return QBrush(sc)
+            if col in (COL_AGG, COL_LIB, COL_INBRD):
+                if col == COL_AGG:
+                    base = _trait_level_color(_trait_label_from_value("aggression", cat.aggression))
+                elif col == COL_LIB:
+                    base = _trait_level_color(_trait_label_from_value("libido", cat.libido))
+                else:
+                    base = _trait_level_color(_trait_label_from_value("inbredness", cat.inbredness))
+                if compat == 'incompatible':
+                    return QBrush(QColor(base.red() // 4, base.green() // 4, base.blue() // 4))
+                if compat == 'risky':
+                    return QBrush(QColor(base.red() // 2, base.green() // 2, base.blue() // 2))
+                return QBrush(base)
             if compat == 'incompatible':
                 return QBrush(QColor(18, 12, 14))
             if compat == 'risky':
@@ -2341,7 +2391,7 @@ class CatTableModel(QAbstractTableModel):
                 return QBrush(QColor(65, 55, 60))
             if compat == 'risky':
                 return QBrush(QColor(130, 110, 60))
-            if col in STAT_COLS or col == COL_STAT:
+            if col in STAT_COLS or col == COL_STAT or col in (COL_AGG, COL_LIB, COL_INBRD):
                 return QBrush(QColor(255, 255, 255))
 
         elif role == Qt.ToolTipRole:
@@ -3014,6 +3064,15 @@ class CatDetailPanel(QWidget):
                 return lo_label
             return f"{lo_label} to {hi_label}"
 
+        def _trait_chip(text: str) -> QLabel:
+            chip = _chip(text)
+            color = _trait_level_color(text)
+            chip.setStyleSheet(
+                f"QLabel {{ background:rgb({color.red()},{color.green()},{color.blue()}); "
+                f"color:#fff; border-radius:6px; padding:2px 7px; font-size:11px; }}"
+            )
+            return chip
+
         for field, title in (
             ("aggression", "Aggression"),
             ("libido", "Libido"),
@@ -3024,11 +3083,11 @@ class CatDetailPanel(QWidget):
             row = QHBoxLayout()
             row.setSpacing(5)
             row.addWidget(QLabel(f"{title}:", styleSheet="color:#555; font-size:10px;"))
-            row.addWidget(_chip(_trait_text(field, va)))
+            row.addWidget(_trait_chip(_trait_text(field, va)))
             row.addWidget(QLabel("x", styleSheet="color:#444; font-size:10px;"))
-            row.addWidget(_chip(_trait_text(field, vb)))
+            row.addWidget(_trait_chip(_trait_text(field, vb)))
             row.addWidget(QLabel("->", styleSheet="color:#666; font-size:10px;"))
-            row.addWidget(_chip(_offspring_trait_text(field, va, vb)))
+            row.addWidget(_trait_chip(_offspring_trait_text(field, va, vb)))
             row.addStretch()
             trait_col.addLayout(row)
 
@@ -3916,6 +3975,12 @@ class RoomOptimizerView(QWidget):
         state = "On" if btn.isChecked() else "Off"
         btn.setText(f"{label}: {state}")
 
+    @staticmethod
+    def _bind_persistent_toggle(btn: QPushButton, label: str, key: str):
+        RoomOptimizerView._set_toggle_button_label(btn, label)
+        btn.toggled.connect(lambda checked: _set_optimizer_flag(key, checked))
+        btn.toggled.connect(lambda _: RoomOptimizerView._set_toggle_button_label(btn, label))
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(
@@ -3999,22 +4064,19 @@ class RoomOptimizerView(QWidget):
 
         self._minimize_variance_checkbox = QPushButton()
         self._minimize_variance_checkbox.setCheckable(True)
-        self._minimize_variance_checkbox.setChecked(True)
+        self._minimize_variance_checkbox.setChecked(_saved_optimizer_flag("minimize_variance", True))
         self._minimize_variance_checkbox.setStyleSheet(
             "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
             "border-radius:4px; padding:6px 12px; font-size:11px; }"
             "QPushButton:checked { background:#2a4a5a; color:#ddd; border:1px solid #4a6a7a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._set_toggle_button_label(self._minimize_variance_checkbox, "Minimize Variance")
-        self._minimize_variance_checkbox.toggled.connect(
-            lambda _: self._set_toggle_button_label(self._minimize_variance_checkbox, "Minimize Variance")
-        )
+        self._bind_persistent_toggle(self._minimize_variance_checkbox, "Minimize Variance", "minimize_variance")
         controls.addWidget(self._minimize_variance_checkbox)
 
         self._avoid_lovers_checkbox = QPushButton()
         self._avoid_lovers_checkbox.setCheckable(True)
-        self._avoid_lovers_checkbox.setChecked(True)
+        self._avoid_lovers_checkbox.setChecked(_saved_optimizer_flag("avoid_lovers", True))
         self._avoid_lovers_checkbox.setToolTip(
             "If enabled, cats that already have lovers will not be paired with other cats."
         )
@@ -4024,15 +4086,12 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#5a3a2a; color:#ddd; border:1px solid #8a5a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._set_toggle_button_label(self._avoid_lovers_checkbox, "Avoid Lovers")
-        self._avoid_lovers_checkbox.toggled.connect(
-            lambda _: self._set_toggle_button_label(self._avoid_lovers_checkbox, "Avoid Lovers")
-        )
+        self._bind_persistent_toggle(self._avoid_lovers_checkbox, "Avoid Lovers", "avoid_lovers")
         controls.addWidget(self._avoid_lovers_checkbox)
 
         self._prefer_low_aggression_checkbox = QPushButton()
         self._prefer_low_aggression_checkbox.setCheckable(True)
-        self._prefer_low_aggression_checkbox.setChecked(True)
+        self._prefer_low_aggression_checkbox.setChecked(_saved_optimizer_flag("prefer_low_aggression", True))
         self._prefer_low_aggression_checkbox.setToolTip(
             "If enabled, optimizer gives extra weight to lower-aggression cats."
         )
@@ -4042,15 +4101,12 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#4a2a2a; color:#ddd; border:1px solid #7a4a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._set_toggle_button_label(self._prefer_low_aggression_checkbox, "Prefer Low Aggression")
-        self._prefer_low_aggression_checkbox.toggled.connect(
-            lambda _: self._set_toggle_button_label(self._prefer_low_aggression_checkbox, "Prefer Low Aggression")
-        )
+        self._bind_persistent_toggle(self._prefer_low_aggression_checkbox, "Prefer Low Aggression", "prefer_low_aggression")
         controls.addWidget(self._prefer_low_aggression_checkbox)
 
         self._prefer_high_libido_checkbox = QPushButton()
         self._prefer_high_libido_checkbox.setCheckable(True)
-        self._prefer_high_libido_checkbox.setChecked(True)
+        self._prefer_high_libido_checkbox.setChecked(_saved_optimizer_flag("prefer_high_libido", True))
         self._prefer_high_libido_checkbox.setToolTip(
             "If enabled, optimizer gives extra weight to higher-libido cats."
         )
@@ -4060,10 +4116,7 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#2a4a36; color:#ddd; border:1px solid #4a7a5a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._set_toggle_button_label(self._prefer_high_libido_checkbox, "Prefer High Libido")
-        self._prefer_high_libido_checkbox.toggled.connect(
-            lambda _: self._set_toggle_button_label(self._prefer_high_libido_checkbox, "Prefer High Libido")
-        )
+        self._bind_persistent_toggle(self._prefer_high_libido_checkbox, "Prefer High Libido", "prefer_high_libido")
         controls.addWidget(self._prefer_high_libido_checkbox)
 
         self._optimize_btn = QPushButton("Calculate Optimal Distribution")
@@ -5866,6 +5919,8 @@ class MainWindow(QMainWindow):
             for idx in self._table.selectionModel().selectedRows()
         })
         cats = [c for r in rows[:2] if (c := self._source_model.cat_at(r)) is not None]
+        if len(cats) == 2 and _is_hater_pair(cats[0], cats[1]):
+            cats = cats[:1]
         was_collapsed = self._detail.maximumHeight() == 0
         self._detail.show_cats(cats)
         if cats and was_collapsed:
