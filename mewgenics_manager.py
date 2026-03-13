@@ -13,6 +13,7 @@ import struct
 import sqlite3
 import csv
 import json
+import datetime
 import lz4.block
 import os
 import math
@@ -28,11 +29,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
     QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
     QTableWidget, QTableWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QComboBox, QMessageBox, QSpinBox,
+    QComboBox, QMessageBox, QSpinBox, QProgressBar, QTabWidget,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
     QFileSystemWatcher, QItemSelectionModel, QSize, Signal, QRegularExpression, QTimer,
+    QThread,
 )
 from PySide6.QtGui import (
     QColor, QBrush, QAction, QPalette, QFont, QKeySequence, QFontMetrics,
@@ -86,6 +88,38 @@ def _enforce_min_font_in_widget_tree(root: Optional[QWidget], min_px: int = _ACC
             adjusted = _with_min_font_px(style, min_px=min_px)
             if adjusted != style:
                 widget.setStyleSheet(adjusted)
+
+def _apply_font_offset_to_tree(root: Optional[QWidget], offset_px: int):
+    """
+    Walk the widget tree and adjust every hardcoded `font-size:Npx` in
+    stylesheets by `offset_px`.  Each widget's *original* stylesheet is
+    stored as the Qt dynamic property ``_orig_ss`` on first encounter so
+    subsequent calls always scale from the original, not the already-scaled
+    value.
+    """
+    if root is None:
+        return
+    min_px = max(8, _ACCESSIBILITY_MIN_FONT_PX + offset_px)
+    for widget in [root] + root.findChildren(QWidget):
+        style = widget.styleSheet()
+        if not style or "font-size" not in style:
+            continue
+        orig = widget.property("_orig_ss")
+        if orig is None:
+            # Always snapshot the stylesheet before we ever modify it.
+            # Recover the true original by stripping any previous offset that
+            # was applied by a prior call (identified by checking the current
+            # offset stored on the widget).
+            widget.setProperty("_orig_ss", style)
+            orig = style
+        new_style = _FONT_SIZE_RE.sub(
+            lambda m, _off=offset_px, _min=min_px: (
+                f"{m.group(1)}{max(_min, int(m.group(2)) + _off)}{m.group(3)}"
+            ),
+            orig,
+        ) if offset_px != 0 else orig
+        if new_style != style:
+            widget.setStyleSheet(new_style)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1556,15 +1590,16 @@ def get_all_ancestors(cat: Optional[Cat], depth: int = 6) -> set:
 
 def _ancestor_depths(cat: Optional[Cat], max_depth: int = 8) -> dict[Cat, int]:
     """
-    Return a map of ancestor -> generational distance.
+    Return a map of ancestor -> generational distance (minimum).
     Includes `cat` itself at depth 0, then parents at depth 1, etc.
     """
     if cat is None:
         return {}
+    from collections import deque
     depths: dict[Cat, int] = {cat: 0}
-    frontier: list[tuple[Cat, int]] = [(cat, 0)]
+    frontier: deque = deque([(cat, 0)])
     while frontier:
-        cur, d = frontier.pop(0)
+        cur, d = frontier.popleft()
         if d >= max_depth:
             continue
         for parent in (cur.parent_a, cur.parent_b):
@@ -1601,6 +1636,56 @@ def _ancestor_paths(start: Optional['Cat'], max_steps: int = 12) -> dict['Cat', 
                 continue
             stack.append((parent, path + (parent,), seen | frozenset({pid})))
     return paths
+
+
+def _build_ancestor_paths_batch(
+    cats: list['Cat'],
+    max_steps: int = 12,
+) -> dict[int, dict['Cat', list[tuple['Cat', ...]]]]:
+    """
+    Compute ancestor paths for all cats using a shared memo keyed by id(cat).
+
+    Processes cats in ascending generation order so each parent's paths are
+    already in the memo when a child is processed.  This avoids re-traversing
+    shared ancestry sub-trees: instead of O(n × 2^depth) work the total is
+    proportional to the unique paths in the pedigree graph.
+
+    Returns: {db_key: ancestor_paths_dict}
+    """
+    # Sort ascending by generation so founders (gen 0) come first.
+    ordered = sorted(cats, key=lambda c: c.generation)
+
+    # memo maps id(cat) -> that cat's ancestor-paths dict
+    memo: dict[int, dict['Cat', list[tuple['Cat', ...]]]] = {}
+
+    result: dict[int, dict['Cat', list[tuple['Cat', ...]]]] = {}
+
+    for cat in ordered:
+        # Start: cat reaches itself with a length-1 path
+        paths: dict['Cat', list[tuple['Cat', ...]]] = {cat: [(cat,)]}
+
+        for parent in (cat.parent_a, cat.parent_b):
+            if parent is None:
+                continue
+            parent_paths = memo.get(id(parent))
+            if parent_paths is None:
+                # Parent absent from the ordered list (e.g. status "Gone") —
+                # fall back to on-demand computation and cache it.
+                parent_paths = _ancestor_paths(parent, max_steps)
+                memo[id(parent)] = parent_paths
+
+            for anc, path_list in parent_paths.items():
+                for path in path_list:
+                    # New path would be (cat,) + path; its step count = len(path).
+                    if len(path) >= max_steps:
+                        continue
+                    new_path = (cat,) + path
+                    paths.setdefault(anc, []).append(new_path)
+
+        memo[id(cat)] = paths
+        result[cat.db_key] = paths
+
+    return result
 
 
 def raw_coi(a: Optional['Cat'], b: Optional['Cat'], max_steps: int = 12) -> float:
@@ -1651,6 +1736,99 @@ def _raw_coi_from_paths(
                 sb = len(path_b) - 1
                 coi += 0.5 ** (sa + sb + 1)
     return coi
+
+
+_MIN_CONTRIB = 1e-10  # prune ancestors with contribution < 2^-33 (depth > 33)
+
+def _ancestor_contributions(cat: Optional['Cat'], max_depth: int = 14) -> dict['Cat', float]:
+    """
+    For each reachable ancestor, return the sum of (0.5 ** depth) over every
+    path from *cat* to that ancestor.  This is a compact float per ancestor
+    instead of a list of full path tuples, and supports O(|common ancestors|)
+    COI calculation via _coi_from_contribs().
+    """
+    if cat is None:
+        return {}
+    contribs: dict['Cat', float] = {}
+    stack: list[tuple['Cat', int, float]] = [(cat, 0, 1.0)]
+    while stack:
+        node, depth, prob = stack.pop()
+        contribs[node] = contribs.get(node, 0.0) + prob
+        if depth >= max_depth:
+            continue
+        half_prob = prob * 0.5
+        if half_prob < _MIN_CONTRIB:
+            continue
+        for parent in (node.parent_a, node.parent_b):
+            if parent is not None:
+                stack.append((parent, depth + 1, half_prob))
+    return contribs
+
+
+def _build_ancestor_contribs_batch(
+    cats: list['Cat'],
+    max_depth: int = 14,
+) -> dict[int, dict['Cat', float]]:
+    """
+    Batch-compute ancestor contribution dicts for all cats using a shared memo
+    (same memoisation strategy as _build_ancestor_paths_batch, but storing
+    floats instead of path tuples).  O(unique edges in pedigree graph) total
+    instead of O(n × 2^depth).
+
+    Returns: {db_key: {ancestor: float}}
+    """
+    ordered = sorted(cats, key=lambda c: c.generation)
+    memo: dict[int, dict['Cat', float]] = {}
+    result: dict[int, dict['Cat', float]] = {}
+
+    for cat in ordered:
+        contribs: dict['Cat', float] = {cat: 1.0}
+
+        for parent in (cat.parent_a, cat.parent_b):
+            if parent is None:
+                continue
+            pc = memo.get(id(parent))
+            if pc is None:
+                pc = _ancestor_contributions(parent, max_depth)
+                memo[id(parent)] = pc
+            for anc, prob in pc.items():
+                new_prob = prob * 0.5
+                if new_prob < _MIN_CONTRIB:
+                    continue
+                contribs[anc] = contribs.get(anc, 0.0) + new_prob
+
+        memo[id(cat)] = contribs
+        result[cat.db_key] = contribs
+
+    return result
+
+
+def _coi_from_contribs(
+    ca: dict['Cat', float],
+    cb: dict['Cat', float],
+) -> float:
+    """
+    Compute raw COI from two ancestor-contribution dicts.
+
+    COI ≈ 0.5 × Σ_{A in common} ca[A] × cb[A]
+
+    This approximates the full Wright path-coefficient formula without the
+    path-overlap exclusion check.  For typical (non-extreme) pedigrees the
+    result is identical; for heavily line-bred animals it may slightly
+    overestimate, but for the UI's purposes (percentage risk) this is fine.
+    Time: O(|common ancestors|), no path objects created.
+    """
+    if not ca or not cb:
+        return 0.0
+    coi = 0.0
+    # Iterate over the smaller dict
+    if len(ca) > len(cb):
+        ca, cb = cb, ca
+    for anc, prob_a in ca.items():
+        prob_b = cb.get(anc)
+        if prob_b is not None:
+            coi += prob_a * prob_b
+    return coi * 0.5
 
 
 def risk_percent(a: Optional['Cat'], b: Optional['Cat']) -> float:
@@ -1713,6 +1891,278 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
 
 def _is_hater_pair(a: 'Cat', b: 'Cat') -> bool:
     return b in getattr(a, 'haters', []) or a in getattr(b, 'haters', [])
+
+
+# ── Breeding cache (background pre-computation) ─────────────────────────────
+
+def _breeding_cache_path(save_path: str) -> str:
+    return save_path + ".breeding_cache.json"
+
+
+class BreedingCache:
+    """Pre-computed ancestry / risk data shared across all views."""
+
+    def __init__(self):
+        self.ready = False
+        # Per-cat data  (keyed by db_key)
+        self.ancestor_paths: dict[int, dict['Cat', list[tuple['Cat', ...]]]] = {}  # legacy, kept for compat
+        self.ancestor_contribs: dict[int, dict['Cat', float]] = {}  # {ancestor: sum(0.5^d)}
+        self.ancestor_depths: dict[int, dict['Cat', int]] = {}
+        # Pairwise data  (keyed by (min_key, max_key))
+        self.risk_pct: dict[tuple[int, int], float] = {}
+        self.shared_counts: dict[tuple[int, int], tuple[int, int]] = {}
+        # Cat lookup
+        self._cats_by_key: dict[int, 'Cat'] = {}
+
+    # ── disk persistence ──
+
+    def save_to_disk(self, save_path: str):
+        """Persist pairwise results alongside the save file."""
+        data = {
+            "save_mtime": os.path.getmtime(save_path),
+            "risk": {f"{a},{b}": v for (a, b), v in self.risk_pct.items()},
+            "shared": {f"{a},{b}": list(v) for (a, b), v in self.shared_counts.items()},
+        }
+        try:
+            with open(_breeding_cache_path(save_path), "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+
+    @staticmethod
+    def load_from_disk(save_path: str) -> Optional['BreedingCache']:
+        """Load persisted pairwise data if the save file hasn't changed."""
+        cp = _breeding_cache_path(save_path)
+        if not os.path.exists(cp):
+            return None
+        try:
+            with open(cp, "r") as f:
+                data = json.load(f)
+            if abs(data.get("save_mtime", 0) - os.path.getmtime(save_path)) > 0.5:
+                return None  # save file changed, cache is stale
+            cache = BreedingCache()
+            for k, v in data.get("risk", {}).items():
+                a, b = k.split(",")
+                cache.risk_pct[(int(a), int(b))] = float(v)
+            for k, v in data.get("shared", {}).items():
+                a, b = k.split(",")
+                cache.shared_counts[(int(a), int(b))] = (int(v[0]), int(v[1]))
+            # Mark as partially ready — pairwise data available, per-cat data needs recomputation
+            cache.ready = True
+            return cache
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+
+    # ── public helpers ──
+
+    @staticmethod
+    def _pair_key(a_key: int, b_key: int) -> tuple[int, int]:
+        return (a_key, b_key) if a_key < b_key else (b_key, a_key)
+
+    def get_risk(self, a: 'Cat', b: 'Cat') -> float:
+        if not self.ready:
+            return risk_percent(a, b)
+        return self.risk_pct.get(self._pair_key(a.db_key, b.db_key), 0.0)
+
+    def get_shared(self, a: 'Cat', b: 'Cat', recent_depth: int = 3) -> tuple[int, int]:
+        if not self.ready:
+            return shared_ancestor_counts(a, b, recent_depth=recent_depth)
+        return self.shared_counts.get(self._pair_key(a.db_key, b.db_key), (0, 0))
+
+    def get_ancestor_depths_for(self, cat: 'Cat', max_depth: int = 8) -> dict['Cat', int]:
+        if not self.ready:
+            return _ancestor_depths(cat, max_depth=max_depth)
+        return self.ancestor_depths.get(cat.db_key, {})
+
+    def get_ancestor_paths_for(self, cat: 'Cat') -> dict['Cat', list[tuple['Cat', ...]]]:
+        if not self.ready:
+            return _ancestor_paths(cat)
+        return self.ancestor_paths.get(cat.db_key, {})
+
+    def get_raw_coi_from_keys(self, a_key: int, b_key: int) -> float:
+        ca = self.ancestor_contribs.get(a_key)
+        cb = self.ancestor_contribs.get(b_key)
+        if ca is None or cb is None:
+            return 0.0
+        return _coi_from_contribs(ca, cb)
+
+
+class BreedingCacheWorker(QThread):
+    """Computes the full BreedingCache off the main thread."""
+    progress = Signal(int, int)   # (current, total)
+    phase1_ready = Signal(object)   # emits cache after phase 1 (ancestry only, no pairwise risk yet)
+    finished_cache = Signal(object)  # emits the BreedingCache
+
+    def __init__(self, cats: list['Cat'], save_path: str = "",
+                 existing_pairwise: Optional['BreedingCache'] = None,
+                 prev_cache: Optional['BreedingCache'] = None,
+                 prev_parent_keys: Optional[dict[int, tuple]] = None,
+                 parent=None):
+        super().__init__(parent)
+        self._cats = cats
+        self._save_path = save_path
+        self._existing = existing_pairwise  # disk-loaded cache with pairwise data only
+        self._prev_cache = prev_cache       # previous in-memory cache for incremental update
+        self._prev_parent_keys = prev_parent_keys or {}  # db_key -> (pa_key, pb_key) from prev load
+
+    @staticmethod
+    def _parent_key_tuple(cat: 'Cat') -> tuple:
+        pa = cat.parent_a.db_key if cat.parent_a is not None else None
+        pb = cat.parent_b.db_key if cat.parent_b is not None else None
+        return (pa, pb)
+
+    def run(self):
+        alive = [c for c in self._cats if c.status != "Gone"]
+        n = len(alive)
+
+        has_pairwise = (
+            self._existing is not None
+            and self._existing.ready
+            and len(self._existing.risk_pct) > 0
+        )
+
+        if has_pairwise:
+            # Disk cache hit: pairwise data already loaded; only rebuild per-cat
+            # ancestry (depths + contribs) for display / future incremental use.
+            cache = self._existing
+            cache._cats_by_key = {c.db_key: c for c in alive}
+            self.progress.emit(0, n)
+            batch = _build_ancestor_contribs_batch(alive)
+            cache.ancestor_contribs.update(batch)
+            for cat in alive:
+                cache.ancestor_depths[cat.db_key] = _ancestor_depths(cat, max_depth=8)
+            cache.ready = True
+            self.progress.emit(n, n)
+            self.finished_cache.emit(cache)
+            return
+
+        # ── Incremental mode: reuse unchanged cats from prev in-memory cache ──
+        prev = self._prev_cache
+        unchanged_keys: set[int] = set()
+        alive_keys = {c.db_key for c in alive}
+        if prev is not None and prev.ready and len(prev.risk_pct) > 0:
+            for cat in alive:
+                k = cat.db_key
+                old_parents = self._prev_parent_keys.get(k)
+                new_parents = self._parent_key_tuple(cat)
+                if old_parents == new_parents and k in prev.ancestor_contribs:
+                    unchanged_keys.add(k)
+        else:
+            prev = None
+
+        changed_keys = alive_keys - unchanged_keys
+
+        cache = BreedingCache()
+        cache._cats_by_key = {c.db_key: c for c in alive}
+
+        # ── Phase 1: per-cat ancestry (batch-memoized) ──
+        # Reuse unchanged contribs / depths from prev
+        if prev is not None:
+            for k in unchanged_keys:
+                cache.ancestor_contribs[k] = prev.ancestor_contribs[k]
+                cache.ancestor_depths[k] = prev.ancestor_depths[k]
+
+        # Count breedable pairs for progress (skip same-sex)
+        def _can_possibly_breed(a: 'Cat', b: 'Cat') -> bool:
+            ga, gb = a.gender, b.gender
+            return not (ga == gb and ga != "?")
+
+        n_phase2 = sum(
+            1 for i in range(n) for j in range(i + 1, n)
+            if alive[i].db_key not in unchanged_keys or alive[j].db_key not in unchanged_keys
+            if _can_possibly_breed(alive[i], alive[j])
+        )
+        total_steps = max(1, n + n_phase2)
+        self.progress.emit(0, total_steps)
+
+        cats_to_compute = [c for c in alive if c.db_key in changed_keys]
+        if cats_to_compute:
+            # Include all alive cats so memo can traverse through unchanged parents
+            batch = _build_ancestor_contribs_batch(alive)
+            for cat in cats_to_compute:
+                cache.ancestor_contribs[cat.db_key] = batch[cat.db_key]
+                cache.ancestor_depths[cat.db_key] = _ancestor_depths(cat, max_depth=8)
+
+        self.progress.emit(n, total_steps)
+
+        # Emit phase1_ready so Safe Breeding / main table become usable now
+        cache.ready = True  # ancestry complete; risk_pct still empty for dirty pairs
+        self.phase1_ready.emit(cache)
+
+        # ── Phase 2: pairwise risk + shared (skip same-sex, reuse unchanged) ──
+        pairs_to_compute = []
+        for i in range(n):
+            a = alive[i]
+            for j in range(i + 1, n):
+                b = alive[j]
+                if not _can_possibly_breed(a, b):
+                    continue
+                if a.db_key in unchanged_keys and b.db_key in unchanged_keys:
+                    pk = cache._pair_key(a.db_key, b.db_key)
+                    old_risk = prev.risk_pct.get(pk) if prev else None
+                    old_shared = prev.shared_counts.get(pk) if prev else None
+                    if old_risk is not None and old_shared is not None:
+                        cache.risk_pct[pk] = old_risk
+                        cache.shared_counts[pk] = old_shared
+                        continue
+                pairs_to_compute.append((i, j))
+
+        step = n
+        for i, j in pairs_to_compute:
+            a = alive[i]
+            b = alive[j]
+            pk = cache._pair_key(a.db_key, b.db_key)
+
+            ca = cache.ancestor_contribs.get(a.db_key, {})
+            cb = cache.ancestor_contribs.get(b.db_key, {})
+            raw = _coi_from_contribs(ca, cb)
+            cache.risk_pct[pk] = max(0.0, min(100.0, (raw / 0.25) * 100.0))
+
+            da = cache.ancestor_depths.get(a.db_key, {})
+            db_depths = cache.ancestor_depths.get(b.db_key, {})
+            common = set(da.keys()) & set(db_depths.keys())
+            if common:
+                recent = sum(1 for anc in common if da[anc] <= 3 and db_depths[anc] <= 3)
+                cache.shared_counts[pk] = (len(common), recent)
+            else:
+                cache.shared_counts[pk] = (0, 0)
+
+            step += 1
+            if step % 200 == 0:
+                self.progress.emit(step, total_steps)
+
+        self.progress.emit(total_steps, total_steps)
+        if self._save_path:
+            cache.save_to_disk(self._save_path)
+        self.finished_cache.emit(cache)
+
+
+class SaveLoadWorker(QThread):
+    """Parses a save file off the main thread so the UI stays responsive."""
+    status = Signal(str)  # status text updates
+    finished_load = Signal(object)  # emits dict with parsed results
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self._path = path
+
+    def run(self):
+        self.status.emit("Parsing save file…")
+        cats, errors = parse_save(self._path)
+        self.status.emit("Loading blacklist & overrides…")
+        _load_blacklist(self._path, cats)
+        _load_must_breed(self._path, cats)
+        applied_overrides, override_rows = _load_gender_overrides(self._path, cats)
+        cal_explicit, cal_token, cal_rows = _apply_calibration(self._path, cats)
+        self.finished_load.emit({
+            "cats": cats,
+            "errors": errors,
+            "applied_overrides": applied_overrides,
+            "override_rows": override_rows,
+            "cal_explicit": cal_explicit,
+            "cal_token": cal_token,
+            "cal_rows": cal_rows,
+        })
 
 
 # ── Compatibility check ───────────────────────────────────────────────────────
@@ -2341,6 +2791,31 @@ class CatTableModel(QAbstractTableModel):
         self._ancestor_ids_cache: dict[int, frozenset[int]] = {}
         self._parent_ids_cache: dict[int, frozenset[int]] = {}
         self._hater_ids_cache: dict[int, frozenset[int]] = {}
+        self._breeding_cache: Optional[BreedingCache] = None
+
+    def set_breeding_cache(self, cache: Optional['BreedingCache']):
+        self._breeding_cache = cache
+        self._relation_cache.clear()
+        self._compat_cache.clear()
+        # Fill deferred caches from breeding cache data
+        if cache is not None and cache.ready:
+            for cat in self._cats:
+                depths = cache.ancestor_depths.get(cat.db_key, {})
+                self._ancestor_ids_cache[id(cat)] = frozenset(
+                    id(anc) for anc in depths if anc is not cat
+                )
+                if cat.parent_a is not None and cat.parent_b is not None:
+                    da = cache.ancestor_depths.get(cat.parent_a.db_key, {})
+                    db = cache.ancestor_depths.get(cat.parent_b.db_key, {})
+                    self._inbred_score_cache[id(cat)] = len(set(da.keys()) & set(db.keys()))
+                else:
+                    self._inbred_score_cache[id(cat)] = 0
+        if self._cats:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._cats) - 1, len(COLUMNS) - 1),
+                [Qt.DisplayRole, Qt.UserRole, Qt.BackgroundRole, Qt.ForegroundRole],
+            )
 
     def set_show_lineage(self, show: bool):
         self._show_lineage = show
@@ -2356,10 +2831,7 @@ class CatTableModel(QAbstractTableModel):
         self._cats = cats
         self._relation_cache.clear()
         self._compat_cache.clear()
-        self._ancestor_ids_cache = {
-            id(cat): frozenset(id(anc) for anc in get_all_ancestors(cat))
-            for cat in cats
-        }
+        # Cheap caches — computed inline
         self._parent_ids_cache = {
             id(cat): frozenset(id(parent) for parent in get_parents(cat))
             for cat in cats
@@ -2368,11 +2840,9 @@ class CatTableModel(QAbstractTableModel):
             id(cat): frozenset(id(hater) for hater in getattr(cat, "haters", []))
             for cat in cats
         }
-        self._inbred_score_cache = {
-            id(cat): len(find_common_ancestors(cat.parent_a, cat.parent_b))
-            if cat.parent_a is not None and cat.parent_b is not None else 0
-            for cat in cats
-        }
+        # Expensive caches — start empty, filled by breeding cache or on-demand
+        self._ancestor_ids_cache = {}
+        self._inbred_score_cache = {}
         self.endResetModel()
 
     def set_focus_cat(self, cat: Optional[Cat]):
@@ -2397,7 +2867,11 @@ class CatTableModel(QAbstractTableModel):
         cached = self._relation_cache.get(key)
         if cached is not None:
             return cached
-        pct = risk_percent(self._focus_cat, cat)
+        bc = self._breeding_cache
+        if bc is not None and bc.ready:
+            pct = bc.get_risk(self._focus_cat, cat)
+        else:
+            pct = risk_percent(self._focus_cat, cat)
         self._relation_cache[key] = pct
         return pct
 
@@ -4029,6 +4503,7 @@ class SafeBreedingView(QWidget):
         self._alive: list[Cat] = []
         self._by_key: dict[int, Cat] = {}
         self._table_row_cat_keys: list[int] = []
+        self._cache: Optional[BreedingCache] = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -4098,6 +4573,13 @@ class SafeBreedingView(QWidget):
         else:
             self._render_for(None)
 
+    def set_cache(self, cache: Optional['BreedingCache']):
+        self._cache = cache
+        # Re-render the currently selected cat with cached data
+        cur = self._list.currentItem()
+        if cur is not None:
+            self._render_for(self._by_key.get(int(cur.data(Qt.UserRole))))
+
     def select_cat(self, cat: Optional[Cat]):
         if cat is None or cat.db_key not in self._by_key:
             return
@@ -4154,6 +4636,7 @@ class SafeBreedingView(QWidget):
             self._summary.setText("Select an alive cat.")
             return
 
+        cache = self._cache
         self._title.setText(f"Safe Breeding — {cat.name}")
         candidates: list[tuple[float, int, int, Cat]] = []
         for other in self._alive:
@@ -4162,12 +4645,20 @@ class SafeBreedingView(QWidget):
             ok, _ = can_breed(cat, other)
             if not ok:
                 continue
-            shared, recent_shared = shared_ancestor_counts(cat, other, recent_depth=3)
-            rel = risk_percent(cat, other)
+            if cache is not None and cache.ready:
+                shared, recent_shared = cache.get_shared(cat, other, recent_depth=3)
+                rel = cache.get_risk(cat, other)
+            else:
+                shared, recent_shared = shared_ancestor_counts(cat, other, recent_depth=3)
+                rel = risk_percent(cat, other)
             closest_recent_gen = 0
             if recent_shared:
-                da = _ancestor_depths(cat, max_depth=8)
-                db = _ancestor_depths(other, max_depth=8)
+                if cache is not None and cache.ready:
+                    da = cache.get_ancestor_depths_for(cat)
+                    db = cache.get_ancestor_depths_for(other)
+                else:
+                    da = _ancestor_depths(cat, max_depth=8)
+                    db = _ancestor_depths(other, max_depth=8)
                 common = set(da.keys()) & set(db.keys())
                 recent_levels = [
                     max(da[anc], db[anc])
@@ -4362,6 +4853,8 @@ class RoomOptimizerView(QWidget):
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
         self._cats: list[Cat] = []
+        self._cache: Optional[BreedingCache] = None
+        self._optimizer_worker: Optional[RoomOptimizerWorker] = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -4542,9 +5035,25 @@ class RoomOptimizerView(QWidget):
 
         self._splitter.addWidget(self._table)
 
-        # Details pane
+        # Bottom tabs: Cat Locator, Breeding Pairs, Excluded
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.setStyleSheet(
+            "QTabWidget::pane { border:1px solid #1e1e38; background:#0a0a18; }"
+            "QTabBar::tab { background:#14142a; color:#888; padding:6px 14px; border:1px solid #1e1e38;"
+            " border-bottom:none; margin-right:2px; font-size:11px; }"
+            "QTabBar::tab:selected { background:#1a1a36; color:#ddd; font-weight:bold; }"
+            "QTabBar::tab:hover { background:#1e1e3a; color:#bbb; }"
+        )
+
+        # Tab 1: Cat Locator
+        self._cat_locator = RoomOptimizerCatLocator()
+        self._bottom_tabs.addTab(self._cat_locator, "Cat Locator")
+
+        # Tab 2: Breeding Pairs (existing detail panel)
         self._details_pane = RoomOptimizerDetailPanel()
-        self._splitter.addWidget(self._details_pane)
+        self._bottom_tabs.addTab(self._details_pane, "Breeding Pairs")
+
+        self._splitter.addWidget(self._bottom_tabs)
         self._splitter.setSizes([180, 420])
 
         root.addWidget(self._splitter, 1)
@@ -4588,13 +5097,14 @@ class RoomOptimizerView(QWidget):
         else:
             self._summary.setText(f"{alive_count} alive cats available")
 
-    def _calculate_optimal_distribution(self):
-        """Calculate and display optimal room distribution."""
-        excluded_keys = getattr(self, "_excluded_keys", set())
-        alive_cats = [c for c in self._cats if c.status != "Gone" and c.db_key not in excluded_keys]
-        excluded_cats = [c for c in self._cats if c.status != "Gone" and c.db_key in excluded_keys]
+    def set_cache(self, cache: Optional['BreedingCache']):
+        self._cache = cache
 
-        # Get minimum stats filter
+    def _calculate_optimal_distribution(self):
+        """Kick off background optimizer worker."""
+        if self._optimizer_worker is not None and self._optimizer_worker.isRunning():
+            return  # already running
+
         min_stats = 0
         try:
             if self._min_stats_input.text().strip():
@@ -4602,491 +5112,99 @@ class RoomOptimizerView(QWidget):
         except ValueError:
             pass
 
-        # Get maximum risk filter
-        max_risk = 100  # Default: allow all
+        max_risk = 100.0
         try:
             if self._max_risk_input.text().strip():
                 max_risk = float(self._max_risk_input.text().strip())
         except ValueError:
             pass
 
-        # Get minimize variance option
-        minimize_variance = self._minimize_variance_checkbox.isChecked()
-        avoid_lovers = self._avoid_lovers_checkbox.isChecked()
-        prefer_low_aggression = self._prefer_low_aggression_checkbox.isChecked()
-        prefer_high_libido = self._prefer_high_libido_checkbox.isChecked()
+        params = {
+            "min_stats": min_stats,
+            "max_risk": max_risk,
+            "minimize_variance": self._minimize_variance_checkbox.isChecked(),
+            "avoid_lovers": self._avoid_lovers_checkbox.isChecked(),
+            "prefer_low_aggression": self._prefer_low_aggression_checkbox.isChecked(),
+            "prefer_high_libido": self._prefer_high_libido_checkbox.isChecked(),
+            "mode_family": self._mode_toggle_btn.isChecked(),
+        }
 
-        # Filter cats by minimum stats
-        if min_stats > 0:
-            alive_cats = [c for c in alive_cats if sum(c.base_stats.values()) >= min_stats]
+        self._optimize_btn.setEnabled(False)
+        self._summary.setText("Calculating…")
 
-        if len(alive_cats) < 2:
+        worker = RoomOptimizerWorker(
+            self._cats,
+            getattr(self, "_excluded_keys", set()),
+            self._cache,
+            params,
+            parent=self,
+        )
+        worker.finished.connect(self._on_optimizer_result)
+        self._optimizer_worker = worker
+        worker.start()
+
+    def _on_optimizer_result(self, result: dict):
+        self._optimizer_worker = None
+        self._optimize_btn.setEnabled(True)
+
+        if "error" in result:
             self._table.setRowCount(0)
-            self._summary.setText("Not enough cats to optimize")
+            self._summary.setText(result["error"])
             return
 
-        stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
-        ancestor_paths = {cat.db_key: _ancestor_paths(cat) for cat in alive_cats}
-        pair_eval_cache: dict[tuple[int, int], tuple[bool, str, float]] = {}
-        hater_key_map: dict[int, set[int]] = {
-            cat.db_key: {other.db_key for other in getattr(cat, "haters", [])}
-            for cat in alive_cats
-        }
-        lover_key_map: dict[int, set[int]] = {
-            cat.db_key: {other.db_key for other in getattr(cat, "lovers", [])}
-            for cat in alive_cats
-        }
+        room_rows = result["room_rows"]
+        locator_data = result["locator_data"]
+        excluded_rows = result["excluded_rows"]
+        mode_family = result["mode_family"]
+        min_stats = result["min_stats"]
+        max_risk = result["max_risk"]
+        minimize_variance = result["minimize_variance"]
+        avoid_lovers = result["avoid_lovers"]
+        prefer_low_aggression = result["prefer_low_aggression"]
+        prefer_high_libido = result["prefer_high_libido"]
 
-        def _pair_key(cat_a: Cat, cat_b: Cat) -> tuple[int, int]:
-            a_key, b_key = cat_a.db_key, cat_b.db_key
-            return (a_key, b_key) if a_key < b_key else (b_key, a_key)
-
-        def _is_hater_conflict(cat_a: Cat, cat_b: Cat) -> bool:
-            haters_a = hater_key_map.get(cat_a.db_key, set())
-            haters_b = hater_key_map.get(cat_b.db_key, set())
-            return cat_b.db_key in haters_a or cat_a.db_key in haters_b
-
-        def _is_mutual_lover_pair(cat_a: Cat, cat_b: Cat) -> bool:
-            lovers_a = lover_key_map.get(cat_a.db_key, set())
-            lovers_b = lover_key_map.get(cat_b.db_key, set())
-            return cat_b.db_key in lovers_a and cat_a.db_key in lovers_b
-
-        def _trait_or_default(value: Optional[float], default: float = 0.5) -> float:
-            if value is None:
-                return default
-            return max(0.0, min(1.0, float(value)))
-
-        def _personality_score(cat_a: Cat, cat_b: Optional[Cat] = None) -> float:
-            cats = [cat_a] if cat_b is None else [cat_a, cat_b]
-            score = 0.0
-            if prefer_low_aggression:
-                score += sum(1.0 - _trait_or_default(cat.aggression) for cat in cats) / len(cats)
-            if prefer_high_libido:
-                score += sum(_trait_or_default(cat.libido) for cat in cats) / len(cats)
-            return score
-
-        def _is_lover_conflict(cat_a: Cat, cat_b: Cat) -> bool:
-            if not avoid_lovers:
-                return False
-            lovers_a = lover_key_map.get(cat_a.db_key, set())
-            lovers_b = lover_key_map.get(cat_b.db_key, set())
-            if lovers_a and cat_b.db_key not in lovers_a:
-                return True
-            if lovers_b and cat_a.db_key not in lovers_b:
-                return True
-            return False
-
-        def _room_conflict(cat_a: Cat, cat_b: Cat) -> bool:
-            if _is_hater_conflict(cat_a, cat_b):
-                return True
-            if _is_lover_conflict(cat_a, cat_b):
-                return True
-            ok, _, risk = _pair_eval(cat_a, cat_b)
-            return ok and risk > max_risk
-
-        def _pair_eval(cat_a: Cat, cat_b: Cat) -> tuple[bool, str, float]:
-            key = _pair_key(cat_a, cat_b)
-            cached = pair_eval_cache.get(key)
-            if cached is not None:
-                return cached
-            ok, reason = can_breed(cat_a, cat_b)
-            if ok and _is_hater_conflict(cat_a, cat_b):
-                ok = False
-                reason = "These cats hate each other"
-            if ok and _is_lover_conflict(cat_a, cat_b):
-                ok = False
-                reason = "One or both cats already have a lover"
-            if ok:
-                pa = ancestor_paths.get(cat_a.db_key) or {}
-                pb = ancestor_paths.get(cat_b.db_key) or {}
-                risk = max(0.0, min(100.0, (_raw_coi_from_paths(pa, pb) / 0.25) * 100.0))
-            else:
-                risk = 0.0
-            pair_eval_cache[key] = (ok, reason, risk)
-            return pair_eval_cache[key]
-
-        # Separate males and females
-        males = [c for c in alive_cats if c.gender == "male"]
-        females = [c for c in alive_cats if c.gender == "female"]
-        unknown = [c for c in alive_cats if c.gender == "?"]
-
-        # Sort by base stats (best first)
-        males.sort(key=lambda c: stat_sum[c.db_key], reverse=True)
-        females.sort(key=lambda c: stat_sum[c.db_key], reverse=True)
-        unknown.sort(key=lambda c: stat_sum[c.db_key], reverse=True)
-        all_cats = males + females + unknown
-
-        mode_family = self._mode_toggle_btn.isChecked()
-
-        if mode_family:
-            # Family-separation mode uses real in-game rooms and tries to spread lineages.
-            all_rooms = list(ROOM_DISPLAY.keys())
-            fallback_room = None
-            max_cats_per_room = 6
-            family_assignments = {
-                room: {"males": [], "females": [], "unknown": []}
-                for room in all_rooms
-            }
-
-            def _room_cats(room_key: str) -> list[Cat]:
-                room_data = family_assignments[room_key]
-                return room_data["males"] + room_data["females"] + room_data["unknown"]
-
-            def _preferred_rooms(cat: Cat) -> list[str]:
-                if avoid_lovers:
-                    return list(all_rooms)
-                lover_rooms: list[str] = []
-                for room in all_rooms:
-                    if any(_is_mutual_lover_pair(cat, existing_cat) for existing_cat in _room_cats(room)):
-                        lover_rooms.append(room)
-                return lover_rooms + [room for room in all_rooms if room not in lover_rooms]
-
-            def _family_group_id(cat: Cat):
-                ancestors = []
-                if cat.parent_a:
-                    ancestors.append(cat.parent_a.db_key)
-                if cat.parent_b:
-                    ancestors.append(cat.parent_b.db_key)
-                for p in (cat.parent_a, cat.parent_b):
-                    if p:
-                        if p.parent_a:
-                            ancestors.append(p.parent_a.db_key)
-                        if p.parent_b:
-                            ancestors.append(p.parent_b.db_key)
-                return tuple(sorted(ancestors)) if ancestors else None
-
-            room_idx = 0
-            for gender_list, gender_key in (
-                (males, "males"),
-                (females, "females"),
-                (unknown, "unknown"),
-            ):
-                family_groups: dict[tuple, list[Cat]] = {}
-                no_family: list[Cat] = []
-
-                for cat in gender_list:
-                    family_id = _family_group_id(cat)
-                    if family_id:
-                        family_groups.setdefault(family_id, []).append(cat)
-                    else:
-                        no_family.append(cat)
-
-                # Place known family groups first, minimizing same-family room collisions.
-                for family_id, family_cats in family_groups.items():
-                    for cat in family_cats:
-                        placed = False
-                        for room in _preferred_rooms(cat):
-                            room_cats = _room_cats(room)
-                            if len(room_cats) < max_cats_per_room:
-                                has_family_conflict = False
-                                has_risk_conflict = False
-                                for existing_cat in room_cats:
-                                    if _family_group_id(existing_cat) == family_id:
-                                        has_family_conflict = True
-                                        break
-                                    if _room_conflict(cat, existing_cat):
-                                        has_risk_conflict = True
-                                        break
-                                if not has_family_conflict and not has_risk_conflict:
-                                    family_assignments[room][gender_key].append(cat)
-                                    placed = True
-                                    break
-
-                        if not placed:
-                            best_room = None
-                            best_score = float("-inf")
-                            for room in _preferred_rooms(cat):
-                                room_cats = _room_cats(room)
-                                if len(room_cats) >= max_cats_per_room:
-                                    continue
-                                risks = [
-                                    _pair_eval(cat, existing_cat)[2]
-                                    for existing_cat in room_cats
-                                    if not _is_hater_conflict(cat, existing_cat)
-                                ]
-                                avg_risk = (sum(risks) / len(risks)) if risks else 0.0
-                                lover_bonus = 0.0 if avoid_lovers else sum(
-                                    1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)
-                                ) * 1000.0
-                                score = lover_bonus - avg_risk + _personality_score(cat)
-                                if score > best_score:
-                                    best_score = score
-                                    best_room = room
-                            if best_room is None:
-                                best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
-                            family_assignments[best_room][gender_key].append(cat)
-
-                # Then place strays / no-family cats by lowest-risk fit.
-                for cat in no_family:
-                    placed = False
-                    for room in _preferred_rooms(cat):
-                        room_cats = _room_cats(room)
-                        if len(room_cats) < max_cats_per_room:
-                            has_risk_conflict = False
-                            for existing_cat in room_cats:
-                                if _room_conflict(cat, existing_cat):
-                                    has_risk_conflict = True
-                                    break
-                            if not has_risk_conflict:
-                                family_assignments[room][gender_key].append(cat)
-                                placed = True
-                                break
-
-                    if not placed:
-                        best_room = None
-                        best_score = float("-inf")
-                        for room in _preferred_rooms(cat):
-                            room_cats = _room_cats(room)
-                            if len(room_cats) >= max_cats_per_room:
-                                continue
-                            risks = [
-                                _pair_eval(cat, existing_cat)[2]
-                                for existing_cat in room_cats
-                                if not _is_hater_conflict(cat, existing_cat)
-                            ]
-                            avg_risk = (sum(risks) / len(risks)) if risks else 0.0
-                            lover_bonus = 0.0 if avoid_lovers else sum(
-                                1 for existing_cat in room_cats if _is_mutual_lover_pair(cat, existing_cat)
-                            ) * 1000.0
-                            score = lover_bonus - avg_risk + _personality_score(cat)
-                            if score > best_score:
-                                best_score = score
-                                best_room = room
-                        if best_room is None:
-                            best_room = min(all_rooms, key=lambda r: len(_room_cats(r)))
-                        family_assignments[best_room][gender_key].append(cat)
-
-            room_assignments = {room: _room_cats(room) for room in all_rooms}
-
-        else:
-            # Pair-quality mode (existing behavior): score breeding pairs then place.
-            priority_rooms = ["Priority 1", "Priority 2", "Priority 3", "Priority 4"]
-            fallback_room = "Fallback"
-            all_rooms = priority_rooms + [fallback_room]
-            room_assignments = {room: [] for room in all_rooms}
-
-            pairs_with_scores = []
-
-            candidate_pairs: list[tuple[Cat, Cat]] = []
-            candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in females)
-            candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in unknown)
-            candidate_pairs.extend((cat_a, cat_b) for cat_a in females for cat_b in unknown)
-            for i, cat_a in enumerate(unknown):
-                for cat_b in unknown[i + 1:]:
-                    candidate_pairs.append((cat_a, cat_b))
-
-            for cat_a, cat_b in candidate_pairs:
-                    ok, _, risk = _pair_eval(cat_a, cat_b)
-                    if not ok or risk > max_risk:
-                        continue
-
-                    # Calculate expected offspring stats based on breeding mechanics
-                    # At 50 stimulation (typical): 60% chance of inheriting better stat
-                    stimulation = 50.0  # Assume typical breeding room stimulation
-                    better_stat_chance = (1.0 + 0.01 * stimulation) / (2.0 + 0.01 * stimulation)
-
-                    expected_stats_sum = 0.0
-                    for stat in STAT_NAMES:
-                        stat_a = cat_a.base_stats[stat]
-                        stat_b = cat_b.base_stats[stat]
-                        better_stat = max(stat_a, stat_b)
-                        worse_stat = min(stat_a, stat_b)
-                        # Expected value: better_stat with better_stat_chance, worse_stat otherwise
-                        expected_stat = better_stat * better_stat_chance + worse_stat * (1.0 - better_stat_chance)
-                        expected_stats_sum += expected_stat
-
-                    avg_base_stats = expected_stats_sum / len(STAT_NAMES)
-
-                    # Bonus for complementary stats (one parent high where the other is low)
-                    complementarity_bonus = 0.0
-                    for stat in STAT_NAMES:
-                        if max(cat_a.base_stats[stat], cat_b.base_stats[stat]) >= 8:
-                            # High stat available for inheritance
-                            complementarity_bonus += 0.5
-
-                    variance_penalty = 0.0
-                    if minimize_variance:
-                        for stat in STAT_NAMES:
-                            gap = abs(cat_a.base_stats[stat] - cat_b.base_stats[stat])
-                            if gap > 2:
-                                variance_penalty += gap * 2.0
-
-                    personality_bonus = _personality_score(cat_a, cat_b) * 2.5
-                    quality = (
-                        (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0)
-                        - variance_penalty
-                        + personality_bonus
-                    )
-
-                    # Boost quality for must-breed cats
-                    must_breed_bonus = 0
-                    if cat_a.must_breed or cat_b.must_breed:
-                        must_breed_bonus = 1000  # Ensures must-breed pairs sort first
-
-                    lover_bonus = 0.0 if avoid_lovers else (500.0 if _is_mutual_lover_pair(cat_a, cat_b) else 0.0)
-
-                    pairs_with_scores.append({
-                        'cat_a': cat_a,
-                        'cat_b': cat_b,
-                        'risk': risk,
-                        'avg_stats': avg_base_stats,
-                        'quality': quality,
-                        'must_breed_bonus': must_breed_bonus,
-                        'lover_bonus': lover_bonus,
-                        'personality_bonus': personality_bonus,
-                    })
-
-            # Sort with must-breed pairs first, then mutual lovers, then by quality.
-            pairs_with_scores.sort(
-                key=lambda p: (p['must_breed_bonus'], p['lover_bonus'], p['quality']),
-                reverse=True,
-            )
-            assigned_cats = set()
-            max_cats_per_priority_room = 6
-
-            for pair in pairs_with_scores:
-                cat_a = pair['cat_a']
-                cat_b = pair['cat_b']
-                if cat_a.db_key in assigned_cats or cat_b.db_key in assigned_cats:
-                    continue
-
-                placed = False
-                for room in priority_rooms:
-                    room_cats = room_assignments[room]
-                    if len(room_cats) >= max_cats_per_priority_room:
-                        continue
-
-                    can_place_both = True
-                    for existing_cat in room_cats:
-                        if _room_conflict(cat_a, existing_cat):
-                            can_place_both = False
-                            break
-
-                        if _room_conflict(cat_b, existing_cat):
-                            can_place_both = False
-                            break
-
-                    if can_place_both and len(room_cats) + 2 <= max_cats_per_priority_room:
-                        room_assignments[room].extend([cat_a, cat_b])
-                        assigned_cats.add(cat_a.db_key)
-                        assigned_cats.add(cat_b.db_key)
-                        placed = True
-                        break
-
-                if not placed:
-                    for cat in [cat_a, cat_b]:
-                        if cat.db_key in assigned_cats:
-                            continue
-                        preferred_rooms = sorted(
-                            priority_rooms,
-                            key=lambda room: (
-                                avoid_lovers or not any(
-                                    _is_mutual_lover_pair(cat, existing_cat) for existing_cat in room_assignments[room]
-                                ),
-                                len(room_assignments[room]),
-                            ),
-                        )
-                        for room in preferred_rooms:
-                            room_cats = room_assignments[room]
-                            if len(room_cats) >= max_cats_per_priority_room:
-                                continue
-
-                            compatible = True
-                            for existing_cat in room_cats:
-                                if _room_conflict(cat, existing_cat):
-                                    compatible = False
-                                    break
-                            if compatible:
-                                room_assignments[room].append(cat)
-                                assigned_cats.add(cat.db_key)
-                                break
-
-            for cat in all_cats:
-                if cat.db_key not in assigned_cats:
-                    room_assignments[fallback_room].append(cat)
-
-        # Display results
+        self._cat_locator.show_assignments(locator_data)
         self._table.setRowCount(0)
         self._details_pane.show_room(None)
+
         row_idx = 0
         total_pairs = 0
         total_assigned = 0
 
-        for room in all_rooms:
-            cats_in_room = room_assignments[room]
+        for room_data in room_rows:
+            room_label = room_data["room_label"]
+            cat_names = room_data["cat_names"]
+            room_pairs = room_data["pairs"]
+            avg_stats = room_data["avg_stats"]
+            avg_risk = room_data["avg_risk"]
+            is_fallback = room_data["is_fallback"]
 
-            if not cats_in_room:
-                continue
-
-            total_assigned += len(cats_in_room)
-
-            # Calculate expected pairs and outcomes for this room
-            room_pairs = []
-            for i, cat_a in enumerate(cats_in_room):
-                for cat_b in cats_in_room[i+1:]:
-                    ok, _, risk = _pair_eval(cat_a, cat_b)
-                    if ok:
-                        # Use base stats for offspring predictions
-                        avg_base_stats = (stat_sum[cat_a.db_key] + stat_sum[cat_b.db_key]) / 2
-                        stat_ranges = {
-                            stat: (
-                                min(cat_a.base_stats[stat], cat_b.base_stats[stat]),
-                                max(cat_a.base_stats[stat], cat_b.base_stats[stat]),
-                            )
-                            for stat in STAT_NAMES
-                        }
-                        sum_lo = sum(lo for lo, _ in stat_ranges.values())
-                        sum_hi = sum(hi for _, hi in stat_ranges.values())
-                        room_pairs.append({
-                            'cat_a': cat_a,
-                            'cat_b': cat_b,
-                            'risk': risk,
-                            'avg_stats': avg_base_stats,
-                            'stat_ranges': stat_ranges,
-                            'sum_range': (sum_lo, sum_hi),
-                        })
-
-            if not room_pairs and room != fallback_room:
-                continue
-
+            total_assigned += len(cat_names)
             total_pairs += len(room_pairs)
 
             self._table.insertRow(row_idx)
 
-            # Room name
-            room_label = ROOM_DISPLAY.get(room, room)
             room_item = QTableWidgetItem(room_label)
             room_item.setTextAlignment(Qt.AlignCenter)
-            if fallback_room is not None and room == fallback_room:
+            if is_fallback:
                 room_item.setForeground(QBrush(QColor(150, 150, 150)))
 
-            # Cats to place
-            cat_names = [f"{c.name} ({c.gender_display})" for c in cats_in_room]
             cats_item = QTableWidgetItem(", ".join(cat_names))
 
-            # Expected pairs
             pairs_item = QTableWidgetItem(str(len(room_pairs)))
             pairs_item.setTextAlignment(Qt.AlignCenter)
 
-            # Average stats of expected offspring
-            avg_room_stats = (sum(p['avg_stats'] for p in room_pairs) / len(room_pairs)) if room_pairs else 0.0
-            stats_item = QTableWidgetItem(f"{avg_room_stats:.1f}")
+            stats_item = QTableWidgetItem(f"{avg_stats:.1f}")
             stats_item.setTextAlignment(Qt.AlignCenter)
-
-            # Color code by stats quality
-            if avg_room_stats >= 200:
+            if avg_stats >= 200:
                 stats_item.setForeground(QBrush(QColor(98, 194, 135)))
-            elif avg_room_stats >= 150:
+            elif avg_stats >= 150:
                 stats_item.setForeground(QBrush(QColor(143, 201, 230)))
             else:
                 stats_item.setForeground(QBrush(QColor(190, 145, 40)))
 
-            # Average risk
-            avg_risk = (sum(p['risk'] for p in room_pairs) / len(room_pairs)) if room_pairs else 0.0
             risk_item = QTableWidgetItem(f"{avg_risk:.0f}%")
             risk_item.setTextAlignment(Qt.AlignCenter)
-
-            # Color code by risk
             if avg_risk >= 50:
                 risk_item.setForeground(QBrush(QColor(217, 119, 119)))
             elif avg_risk >= 20:
@@ -5094,38 +5212,24 @@ class RoomOptimizerView(QWidget):
             else:
                 risk_item.setForeground(QBrush(QColor(98, 194, 135)))
 
-            # Details: list all possible pairs
             details_lines = []
-
-            # Sort pairs by stats (descending) and risk (ascending) for better display
-            room_pairs.sort(key=lambda p: (-p['avg_stats'], p['risk']))
-
-            for p in room_pairs[:3]:  # Show top 3 pairs
+            for p in room_pairs[:3]:
                 details_lines.append(
-                    f"{p['cat_a'].name} × {p['cat_b'].name} "
+                    f"{p['cat_a']} × {p['cat_b']} "
                     f"(stats: {p['avg_stats']:.0f}, risk: {p['risk']:.0f}%)"
                 )
             if len(room_pairs) > 3:
                 details_lines.append(f"... and {len(room_pairs) - 3} more")
             details_item = QTableWidgetItem("; ".join(details_lines))
+
             room_item.setData(Qt.UserRole, {
                 "room": room_label,
                 "cats": cat_names,
                 "total_pairs": len(room_pairs),
-                "avg_stats": avg_room_stats,
+                "avg_stats": avg_stats,
                 "avg_risk": avg_risk,
                 "excluded_cats": [],
-                "pairs": [
-                    {
-                        "cat_a": f"{p['cat_a'].name} ({p['cat_a'].gender_display})",
-                        "cat_b": f"{p['cat_b'].name} ({p['cat_b'].gender_display})",
-                        "avg_stats": p["avg_stats"],
-                        "risk": p["risk"],
-                        "sum_range": p["sum_range"],
-                        "stat_ranges": p["stat_ranges"],
-                    }
-                    for p in room_pairs
-                ],
+                "pairs": room_pairs,
             })
 
             self._table.setItem(row_idx, 0, room_item)
@@ -5134,14 +5238,11 @@ class RoomOptimizerView(QWidget):
             self._table.setItem(row_idx, 3, stats_item)
             self._table.setItem(row_idx, 4, risk_item)
             self._table.setItem(row_idx, 5, details_item)
-
             row_idx += 1
 
-        # Dedicated excluded list row
-        if excluded_cats:
-            excluded_names = [f"{c.name} ({c.gender_display})" for c in excluded_cats]
+        if excluded_rows:
+            excluded_names = [r["name"] for r in excluded_rows]
             self._table.insertRow(row_idx)
-
             excluded_room_item = QTableWidgetItem("Excluded")
             excluded_room_item.setTextAlignment(Qt.AlignCenter)
             excluded_room_item.setForeground(QBrush(QColor(170, 120, 120)))
@@ -5152,37 +5253,18 @@ class RoomOptimizerView(QWidget):
                 "avg_stats": 0.0,
                 "avg_risk": 0.0,
                 "excluded_cats": excluded_names,
-                "excluded_cat_rows": [
-                    {
-                        "name": f"{cat.name} ({cat.gender_display})",
-                        "stats": dict(cat.base_stats),
-                        "sum": _cat_base_sum(cat),
-                        "traits": {
-                            "aggression": _trait_label_from_value("aggression", cat.aggression) or "unknown",
-                            "libido": _trait_label_from_value("libido", cat.libido) or "unknown",
-                            "inbredness": _trait_label_from_value("inbredness", cat.inbredness) or "unknown",
-                        },
-                    }
-                    for cat in excluded_cats
-                ],
+                "excluded_cat_rows": excluded_rows,
                 "pairs": [],
             })
-
-            excluded_cats_item = QTableWidgetItem(f"{len(excluded_cats)} excluded cats")
-            dash_item_2 = QTableWidgetItem("—"); dash_item_2.setTextAlignment(Qt.AlignCenter)
-            dash_item_3 = QTableWidgetItem("—"); dash_item_3.setTextAlignment(Qt.AlignCenter)
-            dash_item_4 = QTableWidgetItem("—"); dash_item_4.setTextAlignment(Qt.AlignCenter)
-            excluded_details_item = QTableWidgetItem("Excluded from optimizer breeding calculations")
-
             self._table.setItem(row_idx, 0, excluded_room_item)
-            self._table.setItem(row_idx, 1, excluded_cats_item)
-            self._table.setItem(row_idx, 2, dash_item_2)
-            self._table.setItem(row_idx, 3, dash_item_3)
-            self._table.setItem(row_idx, 4, dash_item_4)
-            self._table.setItem(row_idx, 5, excluded_details_item)
+            self._table.setItem(row_idx, 1, QTableWidgetItem(f"{len(excluded_rows)} excluded cats"))
+            for col in (2, 3, 4):
+                dash = QTableWidgetItem("—")
+                dash.setTextAlignment(Qt.AlignCenter)
+                self._table.setItem(row_idx, col, dash)
+            self._table.setItem(row_idx, 5, QTableWidgetItem("Excluded from optimizer breeding calculations"))
             row_idx += 1
 
-        # Calculate stats
         filter_info = [f"mode: {'family separation' if mode_family else 'pair quality'}"]
         if min_stats > 0:
             filter_info.append(f"min stats: {min_stats}")
@@ -5196,13 +5278,466 @@ class RoomOptimizerView(QWidget):
             filter_info.append("prefer high libido")
         if avoid_lovers:
             filter_info.append("avoid lovers")
-
         filter_str = f"  |  Filters: {', '.join(filter_info)}" if filter_info else ""
 
         self._summary.setText(
             f"Optimized {total_assigned} cats into {row_idx} rooms  |  "
             f"{total_pairs} total breeding pairs{filter_str}"
         )
+
+
+class RoomOptimizerWorker(QThread):
+    """Runs _calculate_optimal_distribution off the main thread."""
+    finished = Signal(object)   # emits result dict
+
+    def __init__(self, cats, excluded_keys, cache, params, parent=None):
+        super().__init__(parent)
+        self._cats = cats
+        self._excluded_keys = excluded_keys
+        self._cache = cache
+        self._params = params  # dict of UI settings
+
+    def run(self):
+        # All computation happens here; no Qt widgets are touched.
+        from types import SimpleNamespace
+        p = self._params
+        cache = self._cache
+
+        excluded_keys = self._excluded_keys
+        alive_cats = [c for c in self._cats if c.status != "Gone" and c.db_key not in excluded_keys]
+        excluded_cats = [c for c in self._cats if c.status != "Gone" and c.db_key in excluded_keys]
+
+        min_stats = p["min_stats"]
+        max_risk = p["max_risk"]
+        minimize_variance = p["minimize_variance"]
+        avoid_lovers = p["avoid_lovers"]
+        prefer_low_aggression = p["prefer_low_aggression"]
+        prefer_high_libido = p["prefer_high_libido"]
+        mode_family = p["mode_family"]
+
+        if min_stats > 0:
+            alive_cats = [c for c in alive_cats if sum(c.base_stats.values()) >= min_stats]
+
+        if len(alive_cats) < 2:
+            self.finished.emit({"error": "Not enough cats to optimize"})
+            return
+
+        stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
+
+        if cache is not None and cache.ready:
+            ancestor_contribs = None  # not needed — use cache.risk_pct directly
+        elif cache is not None and cache.ancestor_contribs:
+            # phase1 done but pairwise not yet — reuse computed contribs
+            ancestor_contribs = cache.ancestor_contribs
+        else:
+            ancestor_contribs = _build_ancestor_contribs_batch(alive_cats)
+
+        pair_eval_cache: dict[tuple[int, int], tuple[bool, str, float]] = {}
+        hater_key_map = {cat.db_key: {o.db_key for o in getattr(cat, "haters", [])} for cat in alive_cats}
+        lover_key_map = {cat.db_key: {o.db_key for o in getattr(cat, "lovers", [])} for cat in alive_cats}
+
+        def _pair_key(a, b):
+            ak, bk = a.db_key, b.db_key
+            return (ak, bk) if ak < bk else (bk, ak)
+
+        def _is_hater_conflict(a, b):
+            return b.db_key in hater_key_map.get(a.db_key, set()) or a.db_key in hater_key_map.get(b.db_key, set())
+
+        def _is_mutual_lover_pair(a, b):
+            return b.db_key in lover_key_map.get(a.db_key, set()) and a.db_key in lover_key_map.get(b.db_key, set())
+
+        def _trait_or_default(v, default=0.5):
+            return default if v is None else max(0.0, min(1.0, float(v)))
+
+        def _personality_score(a, b=None):
+            cats = [a] if b is None else [a, b]
+            score = 0.0
+            if prefer_low_aggression:
+                score += sum(1.0 - _trait_or_default(c.aggression) for c in cats) / len(cats)
+            if prefer_high_libido:
+                score += sum(_trait_or_default(c.libido) for c in cats) / len(cats)
+            return score
+
+        def _is_lover_conflict(a, b):
+            if not avoid_lovers:
+                return False
+            la = lover_key_map.get(a.db_key, set())
+            lb = lover_key_map.get(b.db_key, set())
+            return (la and b.db_key not in la) or (lb and a.db_key not in lb)
+
+        def _pair_eval(a, b):
+            key = _pair_key(a, b)
+            cached = pair_eval_cache.get(key)
+            if cached is not None:
+                return cached
+            ok, reason = can_breed(a, b)
+            if ok and _is_hater_conflict(a, b):
+                ok, reason = False, "These cats hate each other"
+            if ok and _is_lover_conflict(a, b):
+                ok, reason = False, "One or both cats already have a lover"
+            if ok:
+                if cache is not None and cache.ready:
+                    risk = cache.risk_pct.get(cache._pair_key(a.db_key, b.db_key), 0.0)
+                else:
+                    ca = (ancestor_contribs or {}).get(a.db_key) or {}
+                    cb = (ancestor_contribs or {}).get(b.db_key) or {}
+                    risk = max(0.0, min(100.0, (_coi_from_contribs(ca, cb) / 0.25) * 100.0))
+            else:
+                risk = 0.0
+            pair_eval_cache[key] = (ok, reason, risk)
+            return pair_eval_cache[key]
+
+        def _room_conflict(a, b):
+            if _is_hater_conflict(a, b) or _is_lover_conflict(a, b):
+                return True
+            ok, _, risk = _pair_eval(a, b)
+            return ok and risk > max_risk
+
+        males   = sorted([c for c in alive_cats if c.gender == "male"],   key=lambda c: stat_sum[c.db_key], reverse=True)
+        females = sorted([c for c in alive_cats if c.gender == "female"], key=lambda c: stat_sum[c.db_key], reverse=True)
+        unknown = sorted([c for c in alive_cats if c.gender == "?"],      key=lambda c: stat_sum[c.db_key], reverse=True)
+        all_cats = males + females + unknown
+
+        if mode_family:
+            all_rooms = list(ROOM_DISPLAY.keys())
+            fallback_room = None
+            max_cats_per_room = 6
+            family_assignments = {room: {"males": [], "females": [], "unknown": []} for room in all_rooms}
+
+            def _room_cats(room_key):
+                rd = family_assignments[room_key]
+                return rd["males"] + rd["females"] + rd["unknown"]
+
+            def _preferred_rooms(cat):
+                if avoid_lovers:
+                    return list(all_rooms)
+                lover_rooms = [r for r in all_rooms if any(_is_mutual_lover_pair(cat, ec) for ec in _room_cats(r))]
+                return lover_rooms + [r for r in all_rooms if r not in lover_rooms]
+
+            def _family_group_id(cat):
+                ancestors = []
+                for p in (cat.parent_a, cat.parent_b):
+                    if p:
+                        ancestors.append(p.db_key)
+                        for gp in (p.parent_a, p.parent_b):
+                            if gp:
+                                ancestors.append(gp.db_key)
+                return tuple(sorted(ancestors)) if ancestors else None
+
+            for gender_list, gender_key in ((males, "males"), (females, "females"), (unknown, "unknown")):
+                family_groups: dict = {}
+                no_family = []
+                for cat in gender_list:
+                    fid = _family_group_id(cat)
+                    (family_groups.setdefault(fid, []) if fid else no_family).append(cat)
+
+                for fid, fcats in family_groups.items():
+                    for cat in fcats:
+                        placed = False
+                        for room in _preferred_rooms(cat):
+                            rc = _room_cats(room)
+                            if len(rc) >= max_cats_per_room:
+                                continue
+                            if any(_family_group_id(ec) == fid or _room_conflict(cat, ec) for ec in rc):
+                                continue
+                            family_assignments[room][gender_key].append(cat)
+                            placed = True
+                            break
+                        if not placed:
+                            best_room = min(
+                                (r for r in _preferred_rooms(cat) if len(_room_cats(r)) < max_cats_per_room),
+                                key=lambda r: sum(_pair_eval(cat, ec)[2] for ec in _room_cats(r) if not _is_hater_conflict(cat, ec)),
+                                default=min(all_rooms, key=lambda r: len(_room_cats(r))),
+                            )
+                            family_assignments[best_room][gender_key].append(cat)
+
+                for cat in no_family:
+                    placed = False
+                    for room in _preferred_rooms(cat):
+                        rc = _room_cats(room)
+                        if len(rc) < max_cats_per_room and not any(_room_conflict(cat, ec) for ec in rc):
+                            family_assignments[room][gender_key].append(cat)
+                            placed = True
+                            break
+                    if not placed:
+                        best_room = min(
+                            (r for r in _preferred_rooms(cat) if len(_room_cats(r)) < max_cats_per_room),
+                            key=lambda r: sum(_pair_eval(cat, ec)[2] for ec in _room_cats(r) if not _is_hater_conflict(cat, ec)),
+                            default=min(all_rooms, key=lambda r: len(_room_cats(r))),
+                        )
+                        family_assignments[best_room][gender_key].append(cat)
+
+            room_assignments = {room: _room_cats(room) for room in all_rooms}
+
+        else:
+            priority_rooms = ["Priority 1", "Priority 2", "Priority 3", "Priority 4"]
+            fallback_room = "Fallback"
+            all_rooms = priority_rooms + [fallback_room]
+            room_assignments = {room: [] for room in all_rooms}
+
+            candidate_pairs = (
+                [(a, b) for a in males for b in females]
+                + [(a, b) for a in males for b in unknown]
+                + [(a, b) for a in females for b in unknown]
+                + [(unknown[i], unknown[j]) for i in range(len(unknown)) for j in range(i+1, len(unknown))]
+            )
+
+            stimulation = 50.0
+            better_stat_chance = (1.0 + 0.01 * stimulation) / (2.0 + 0.01 * stimulation)
+            pairs_with_scores = []
+            for cat_a, cat_b in candidate_pairs:
+                ok, _, risk = _pair_eval(cat_a, cat_b)
+                if not ok or risk > max_risk:
+                    continue
+                expected_stats_sum = sum(
+                    max(cat_a.base_stats[s], cat_b.base_stats[s]) * better_stat_chance
+                    + min(cat_a.base_stats[s], cat_b.base_stats[s]) * (1.0 - better_stat_chance)
+                    for s in STAT_NAMES
+                )
+                avg_base_stats = expected_stats_sum / len(STAT_NAMES)
+                complementarity_bonus = sum(0.5 for s in STAT_NAMES if max(cat_a.base_stats[s], cat_b.base_stats[s]) >= 8)
+                variance_penalty = sum(
+                    abs(cat_a.base_stats[s] - cat_b.base_stats[s]) * 2.0
+                    for s in STAT_NAMES if minimize_variance and abs(cat_a.base_stats[s] - cat_b.base_stats[s]) > 2
+                )
+                personality_bonus = _personality_score(cat_a, cat_b) * 2.5
+                quality = (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0) - variance_penalty + personality_bonus
+                must_breed_bonus = 1000 if (cat_a.must_breed or cat_b.must_breed) else 0
+                lover_bonus = 0.0 if avoid_lovers else (500.0 if _is_mutual_lover_pair(cat_a, cat_b) else 0.0)
+                pairs_with_scores.append({
+                    "cat_a": cat_a, "cat_b": cat_b, "risk": risk,
+                    "avg_stats": avg_base_stats, "quality": quality,
+                    "must_breed_bonus": must_breed_bonus, "lover_bonus": lover_bonus,
+                })
+
+            pairs_with_scores.sort(key=lambda p: (p["must_breed_bonus"], p["lover_bonus"], p["quality"]), reverse=True)
+            assigned_cats: set[int] = set()
+            max_per_room = 6
+
+            for pair in pairs_with_scores:
+                a, b = pair["cat_a"], pair["cat_b"]
+                if a.db_key in assigned_cats or b.db_key in assigned_cats:
+                    continue
+                placed = False
+                for room in priority_rooms:
+                    rc = room_assignments[room]
+                    if len(rc) >= max_per_room:
+                        continue
+                    if any(_room_conflict(a, ec) or _room_conflict(b, ec) for ec in rc):
+                        continue
+                    if len(rc) + 2 <= max_per_room:
+                        rc.extend([a, b])
+                        assigned_cats.update([a.db_key, b.db_key])
+                        placed = True
+                        break
+                if not placed:
+                    for cat in [a, b]:
+                        if cat.db_key in assigned_cats:
+                            continue
+                        preferred = sorted(
+                            priority_rooms,
+                            key=lambda r: (
+                                avoid_lovers or not any(_is_mutual_lover_pair(cat, ec) for ec in room_assignments[r]),
+                                len(room_assignments[r]),
+                            ),
+                        )
+                        for room in preferred:
+                            rc = room_assignments[room]
+                            if len(rc) < max_per_room and not any(_room_conflict(cat, ec) for ec in rc):
+                                rc.append(cat)
+                                assigned_cats.add(cat.db_key)
+                                break
+
+            for cat in all_cats:
+                if cat.db_key not in assigned_cats:
+                    room_assignments[fallback_room].append(cat)
+
+        # Build locator data
+        locator_data = []
+        for room_idx, room in enumerate(all_rooms):
+            assigned_room_label = ROOM_DISPLAY.get(room, room)
+            for c in room_assignments[room]:
+                current = c.room_display or c.status or "?"
+                needs_move = c.status != "In House" or c.room_display != assigned_room_label
+                locator_data.append({
+                    "name": c.name, "gender_display": c.gender_display,
+                    "age": c.age if c.age is not None else c.db_key,
+                    "current_room": current, "assigned_room": assigned_room_label,
+                    "room_order": room_idx, "needs_move": needs_move,
+                })
+
+        # Build per-room display data (no Qt objects)
+        room_rows = []
+        for room in all_rooms:
+            cats_in_room = room_assignments[room]
+            if not cats_in_room:
+                continue
+            cat_names = [f"{c.name} ({c.gender_display})" for c in cats_in_room]
+            room_pairs = []
+            for i, a in enumerate(cats_in_room):
+                for b in cats_in_room[i+1:]:
+                    ok, _, risk = _pair_eval(a, b)
+                    if ok:
+                        stat_ranges = {s: (min(a.base_stats[s], b.base_stats[s]), max(a.base_stats[s], b.base_stats[s])) for s in STAT_NAMES}
+                        room_pairs.append({
+                            "cat_a": f"{a.name} ({a.gender_display})",
+                            "cat_b": f"{b.name} ({b.gender_display})",
+                            "risk": risk,
+                            "avg_stats": (stat_sum[a.db_key] + stat_sum[b.db_key]) / 2,
+                            "stat_ranges": stat_ranges,
+                            "sum_range": (sum(lo for lo, _ in stat_ranges.values()), sum(hi for _, hi in stat_ranges.values())),
+                        })
+            if not room_pairs and room != fallback_room:
+                continue
+            room_pairs.sort(key=lambda p: (-p["avg_stats"], p["risk"]))
+            avg_stats = sum(p["avg_stats"] for p in room_pairs) / len(room_pairs) if room_pairs else 0.0
+            avg_risk  = sum(p["risk"]      for p in room_pairs) / len(room_pairs) if room_pairs else 0.0
+            room_rows.append({
+                "room": room, "room_label": ROOM_DISPLAY.get(room, room),
+                "cat_names": cat_names, "pairs": room_pairs,
+                "avg_stats": avg_stats, "avg_risk": avg_risk,
+                "is_fallback": room == fallback_room,
+            })
+
+        excluded_rows = [
+            {
+                "name": f"{c.name} ({c.gender_display})",
+                "stats": dict(c.base_stats), "sum": _cat_base_sum(c),
+                "traits": {
+                    "aggression": _trait_label_from_value("aggression", c.aggression) or "unknown",
+                    "libido":     _trait_label_from_value("libido",     c.libido)     or "unknown",
+                    "inbredness": _trait_label_from_value("inbredness", c.inbredness) or "unknown",
+                },
+            }
+            for c in excluded_cats
+        ]
+
+        self.finished.emit({
+            "room_rows": room_rows, "locator_data": locator_data,
+            "excluded_rows": excluded_rows, "excluded_cats": excluded_cats,
+            "min_stats": min_stats, "max_risk": max_risk,
+            "mode_family": mode_family, "minimize_variance": minimize_variance,
+            "avoid_lovers": avoid_lovers,
+            "prefer_low_aggression": prefer_low_aggression,
+            "prefer_high_libido": prefer_high_libido,
+        })
+
+
+class RoomOptimizerCatLocator(QWidget):
+    """Shows all cats with their current location vs assigned room, sorted by room priority."""
+
+    COL_CAT = 0
+    COL_AGE = 1
+    COL_CURRENT = 2
+    COL_MOVE_TO = 3
+    COL_ACTION = 4
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("background:#0a0a18;")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+
+        self._summary = QLabel("Run the optimizer to see cat placements.")
+        self._summary.setStyleSheet("color:#888; font-size:11px;")
+        root.addWidget(self._summary)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["Cat", "Age", "Currently In", "Move To", "Action"])
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setFocusPolicy(Qt.NoFocus)
+        self._table.setSortingEnabled(True)
+        self._table.setAlternatingRowColors(True)
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(self.COL_CAT, QHeaderView.Stretch)
+        hh.setSectionResizeMode(self.COL_AGE, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_CURRENT, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_MOVE_TO, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_ACTION, QHeaderView.Fixed)
+        self._table.setColumnWidth(self.COL_AGE, 70)
+        self._table.setColumnWidth(self.COL_ACTION, 90)
+        self._table.setStyleSheet("""
+            QTableWidget {
+                background:#0d0d1c; alternate-background-color:#131326;
+                color:#ddd; border:1px solid #26264a; font-size:12px;
+            }
+            QTableWidget::item { padding:3px 6px; }
+            QHeaderView::section {
+                background:#16213e; color:#888; padding:5px 4px;
+                border:none; border-bottom:1px solid #1e1e38;
+                border-right:1px solid #16213e; font-size:11px; font-weight:bold;
+            }
+        """)
+        root.addWidget(self._table, 1)
+
+    def show_assignments(self, all_assignments: list[dict]):
+        """
+        all_assignments: list of dicts with keys:
+            name, gender_display, age, current_room, assigned_room, room_order, needs_move
+        Sorted by room_order (Priority 1 first, Fallback last).
+        """
+        # Sort by assigned room priority, then by name within each room
+        all_assignments.sort(key=lambda d: (d.get("room_order", 999), (d["name"] or "").lower()))
+
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(len(all_assignments))
+
+        moves_needed = 0
+        for row, info in enumerate(all_assignments):
+            name_item = QTableWidgetItem(f"{info['name']} ({info['gender_display']})")
+            # Store room_order for sortable "Move To" column
+            name_item.setData(Qt.UserRole, info.get("room_order", 999))
+
+            age_val = info.get("age")
+            if isinstance(age_val, (int, float)):
+                age_item = QTableWidgetItem(f"{age_val:.2f}" if isinstance(age_val, float) else str(age_val))
+                age_item.setData(Qt.UserRole, float(age_val))
+            else:
+                age_item = QTableWidgetItem(str(age_val) if age_val is not None else "?")
+                age_item.setData(Qt.UserRole, 0.0)
+            age_item.setTextAlignment(Qt.AlignCenter)
+
+            current_item = QTableWidgetItem(info["current_room"])
+
+            assigned_item = QTableWidgetItem(info["assigned_room"])
+            # Store room_order so sorting this column keeps room priority order
+            assigned_item.setData(Qt.UserRole, info.get("room_order", 999))
+
+            needs_move = info.get("needs_move", False)
+            if needs_move:
+                moves_needed += 1
+                action_item = QTableWidgetItem("MOVE")
+                action_item.setTextAlignment(Qt.AlignCenter)
+                action_item.setForeground(QBrush(QColor(216, 181, 106)))
+                for it in (name_item, age_item, current_item, assigned_item):
+                    it.setBackground(QBrush(QColor(40, 34, 16)))
+            else:
+                action_item = QTableWidgetItem("OK")
+                action_item.setTextAlignment(Qt.AlignCenter)
+                action_item.setForeground(QBrush(QColor(98, 194, 135)))
+
+            self._table.setItem(row, self.COL_CAT, name_item)
+            self._table.setItem(row, self.COL_AGE, age_item)
+            self._table.setItem(row, self.COL_CURRENT, current_item)
+            self._table.setItem(row, self.COL_MOVE_TO, assigned_item)
+            self._table.setItem(row, self.COL_ACTION, action_item)
+
+        self._table.setSortingEnabled(True)
+        # Default sort: by Move To column (room priority order)
+        self._table.sortByColumn(self.COL_MOVE_TO, Qt.AscendingOrder)
+
+        total = len(all_assignments)
+        stay = total - moves_needed
+        self._summary.setText(
+            f"{total} cats  |  {moves_needed} need to move  |  {stay} already in place"
+        )
+
+    def clear(self):
+        self._table.setRowCount(0)
+        self._summary.setText("Run the optimizer to see cat placements.")
 
 
 class RoomOptimizerDetailPanel(QWidget):
@@ -5355,20 +5890,11 @@ class RoomOptimizerDetailPanel(QWidget):
             return f"{shown}, ... (+{len(names) - limit} more)"
 
         cats_text = _compact_names(cats)
-        excluded_text = _compact_names(excluded_cats)
-        tooltip_parts = []
-        if cats:
-            tooltip_parts.append("Cats: " + ", ".join(cats))
-        if excluded_cats:
-            tooltip_parts.append("Excluded: " + ", ".join(excluded_cats))
-
         self._summary.setText(
             f"{room}  |  Cats: {cats_text}  |  "
             f"Pairs: {total_pairs}  |  Avg offspring stats: {avg_stats:.1f}  |  Avg inbred risk: {avg_risk:.0f}%"
         )
-        if excluded_cats:
-            self._summary.setText(self._summary.text() + f"  |  Excluded: {excluded_text}")
-        self._summary.setToolTip("\n".join(tooltip_parts))
+        self._summary.setToolTip("Cats: " + ", ".join(cats) if cats else "")
 
         self._pairs_table.setRowCount(len(pairs))
         for i, pair in enumerate(pairs, 1):
@@ -5681,6 +6207,7 @@ class PerfectCatPlannerView(QWidget):
         )
         self._cats: list[Cat] = []
         self._excluded_keys: set[int] = set()
+        self._cache: Optional[BreedingCache] = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -5858,8 +6385,22 @@ class PerfectCatPlannerView(QWidget):
         self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self._splitter.addWidget(self._table)
 
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.setStyleSheet(
+            "QTabWidget::pane { border:1px solid #1e1e38; background:#0a0a18; }"
+            "QTabBar::tab { background:#14142a; color:#888; padding:6px 14px; border:1px solid #1e1e38;"
+            " border-bottom:none; margin-right:2px; font-size:11px; }"
+            "QTabBar::tab:selected { background:#1a1a36; color:#ddd; font-weight:bold; }"
+            "QTabBar::tab:hover { background:#1e1e3a; color:#bbb; }"
+        )
+
         self._details_pane = PerfectPlannerDetailPanel()
-        self._splitter.addWidget(self._details_pane)
+        self._bottom_tabs.addTab(self._details_pane, "Stage Details")
+
+        self._cat_locator = RoomOptimizerCatLocator()
+        self._bottom_tabs.addTab(self._cat_locator, "Cat Locator")
+
+        self._splitter.addWidget(self._bottom_tabs)
         self._splitter.setSizes([180, 420])
         root.addWidget(self._splitter, 1)
 
@@ -5886,6 +6427,9 @@ class PerfectCatPlannerView(QWidget):
             self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
         else:
             self._summary.setText(f"{alive_count} alive cats available")
+
+    def set_cache(self, cache: Optional['BreedingCache']):
+        self._cache = cache
 
     def _calculate_plan(self):
         excluded_keys = getattr(self, "_excluded_keys", set())
@@ -5918,11 +6462,16 @@ class PerfectCatPlannerView(QWidget):
         if len(alive_cats) < 2:
             self._table.setRowCount(0)
             self._details_pane.show_stage(None)
+            self._cat_locator.clear()
             self._summary.setText("Not enough cats to build a plan")
             return
 
         stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
-        ancestor_paths = {cat.db_key: _ancestor_paths(cat) for cat in alive_cats}
+        cache = self._cache
+        if cache is not None and cache.ancestor_contribs:
+            ancestor_contribs = cache.ancestor_contribs
+        else:
+            ancestor_contribs = _build_ancestor_contribs_batch(alive_cats)
         parent_key_map = {
             cat.db_key: {parent.db_key for parent in get_parents(cat)}
             for cat in alive_cats
@@ -5996,9 +6545,12 @@ class PerfectCatPlannerView(QWidget):
                 ok = False
                 reason = "One or both cats already have a lover"
             if ok:
-                pa = ancestor_paths.get(cat_a.db_key) or {}
-                pb = ancestor_paths.get(cat_b.db_key) or {}
-                risk = max(0.0, min(100.0, (_raw_coi_from_paths(pa, pb) / 0.25) * 100.0))
+                if cache is not None and cache.ready:
+                    risk = cache.risk_pct.get(cache._pair_key(cat_a.db_key, cat_b.db_key), 0.0)
+                else:
+                    ca = ancestor_contribs.get(cat_a.db_key) or {}
+                    cb = ancestor_contribs.get(cat_b.db_key) or {}
+                    risk = max(0.0, min(100.0, (_coi_from_contribs(ca, cb) / 0.25) * 100.0))
             else:
                 risk = 0.0
             pair_eval_cache[key] = (ok, reason, risk)
@@ -6113,6 +6665,7 @@ class PerfectCatPlannerView(QWidget):
         if not selected_pairs:
             self._table.setRowCount(0)
             self._details_pane.show_stage(None)
+            self._cat_locator.clear()
             self._summary.setText("No low-risk unrelated breeding pairs found under the current filters")
             return
 
@@ -6493,6 +7046,43 @@ class PerfectCatPlannerView(QWidget):
             self._table.setItem(row_idx, 3, dash_cov)
             self._table.setItem(row_idx, 4, dash_risk)
             self._table.setItem(row_idx, 5, details_item)
+
+        # Build cat locator data from all cats involved in the plan
+        locator_cats: dict[int, dict] = {}  # keyed by db_key to deduplicate
+        room_order_counter = 0
+        for idx, pair in enumerate(selected_pairs):
+            pair_label = f"Pair {idx + 1}"
+            for cat in (pair["cat_a"], pair["cat_b"]):
+                if cat.db_key not in locator_cats:
+                    current = cat.room_display or cat.status or "?"
+                    locator_cats[cat.db_key] = {
+                        "name": cat.name,
+                        "gender_display": cat.gender_display,
+                        "age": cat.age if cat.age is not None else cat.db_key,
+                        "current_room": current,
+                        "assigned_room": pair_label,
+                        "room_order": room_order_counter,
+                        "needs_move": False,
+                    }
+            room_order_counter += 1
+        # Add rotation candidates
+        for idx, pair in enumerate(selected_pairs):
+            rotation = _rotation_candidate(pair)
+            if rotation is not None:
+                cat = rotation["candidate"]
+                if cat.db_key not in locator_cats:
+                    current = cat.room_display or cat.status or "?"
+                    locator_cats[cat.db_key] = {
+                        "name": cat.name,
+                        "gender_display": cat.gender_display,
+                        "age": cat.age if cat.age is not None else cat.db_key,
+                        "current_room": current,
+                        "assigned_room": f"Rotation {idx + 1}",
+                        "room_order": room_order_counter,
+                        "needs_move": False,
+                    }
+                    room_order_counter += 1
+        self._cat_locator.show_assignments(list(locator_cats.values()))
 
         if excluded_cats:
             self._summary.setText(
@@ -6937,7 +7527,7 @@ class MainWindow(QMainWindow):
     def _set_bulk_toggle_label(btn: QPushButton, label: str, enabled: bool):
         btn.setText(f"{label}: {'On' if enabled else 'Off'}")
 
-    def __init__(self):
+    def __init__(self, initial_save: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("Mewgenics Breeding Manager")
         self.resize(1440, 900)
@@ -6953,7 +7543,12 @@ class MainWindow(QMainWindow):
         self._room_optimizer_view: Optional[RoomOptimizerView] = None
         self._perfect_planner_view: Optional[PerfectCatPlannerView] = None
         self._calibration_view: Optional[CalibrationView] = None
+        self._breeding_cache: Optional[BreedingCache] = None
+        self._cache_worker: Optional[BreedingCacheWorker] = None
+        self._save_load_worker: Optional[SaveLoadWorker] = None
+        self._prev_parent_keys: dict[int, tuple] = {}
         self._zoom_percent: int = 100
+        self._font_size_offset: int = 0   # pt offset applied on top of zoom
         self._base_font: QFont = QApplication.instance().font()
         self._base_sidebar_width = 190
         self._base_header_height = 46
@@ -6980,12 +7575,25 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._apply_zoom()
 
+        # Progress bar for breeding cache computation
+        self._cache_progress = QProgressBar()
+        self._cache_progress.setFixedWidth(200)
+        self._cache_progress.setFixedHeight(16)
+        self._cache_progress.setTextVisible(True)
+        self._cache_progress.setFormat("Computing breeding data… %p%")
+        self._cache_progress.setStyleSheet(
+            "QProgressBar { background:#1a1a32; border:1px solid #2a2a4a; border-radius:4px; color:#aaa; font-size:10px; }"
+            "QProgressBar::chunk { background:#3f8f72; border-radius:3px; }"
+        )
+        self._cache_progress.hide()
+        self.statusBar().addPermanentWidget(self._cache_progress)
+
         self._watcher = QFileSystemWatcher(self)
         self._watcher.fileChanged.connect(self._on_file_changed)
 
-        saves = find_save_files()
-        if saves:
-            self.load_save(saves[0])
+        if initial_save:
+            # Defer load_save to after the window is shown so the UI appears instantly
+            QTimer.singleShot(0, lambda: self.load_save(initial_save))
 
     # ── Menu ──────────────────────────────────────────────────────────────
 
@@ -7002,6 +7610,24 @@ class MainWindow(QMainWindow):
         ra.setShortcut("F5")
         ra.triggered.connect(self._reload)
         fm.addAction(ra)
+
+        recalc = QAction("Recalculate Breeding Data", self)
+        recalc.setShortcut("Ctrl+F5")
+        recalc.setToolTip("Force full recomputation of breeding data (ignores disk cache)")
+        recalc.triggered.connect(lambda: self._start_breeding_cache(self._cats, force_full=True) if self._cats else None)
+        fm.addAction(recalc)
+
+        clear_cache = QAction("Clear Breeding Cache", self)
+        clear_cache.setToolTip("Delete the on-disk breeding cache for the current save file")
+        clear_cache.triggered.connect(self._clear_breeding_cache)
+        fm.addAction(clear_cache)
+
+        fm.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut("Alt+F4")
+        exit_action.triggered.connect(self.close)
+        fm.addAction(exit_action)
 
         self._recent_saves_separator = fm.addSeparator()
         self._recent_save_actions: list[QAction] = []
@@ -7050,6 +7676,27 @@ class MainWindow(QMainWindow):
         self._zoom_info_action.setEnabled(False)
         sm.addAction(self._zoom_info_action)
         self._update_zoom_info_action()
+
+        sm.addSeparator()
+        fs_in = QAction("Increase Font Size", self)
+        fs_in.setShortcut("Ctrl+]")
+        fs_in.triggered.connect(lambda: self._change_font_size(+1))
+        sm.addAction(fs_in)
+
+        fs_out = QAction("Decrease Font Size", self)
+        fs_out.setShortcut("Ctrl+[")
+        fs_out.triggered.connect(lambda: self._change_font_size(-1))
+        sm.addAction(fs_out)
+
+        fs_reset = QAction("Reset Font Size", self)
+        fs_reset.setShortcut("Ctrl+\\")
+        fs_reset.triggered.connect(lambda: self._set_font_size_offset(0))
+        sm.addAction(fs_reset)
+
+        self._font_size_info_action = QAction("", self)
+        self._font_size_info_action.setEnabled(False)
+        sm.addAction(self._font_size_info_action)
+        self._update_font_size_info_action()
 
     def _refresh_recent_save_actions(self):
         if not hasattr(self, "_file_menu"):
@@ -7188,6 +7835,9 @@ class MainWindow(QMainWindow):
         hs.setStretchFactor(1, 1)
         hs.setSizes([190, 1250])
         _enforce_min_font_in_widget_tree(central)
+        # Snapshot all stylesheet font sizes before any offset is applied,
+        # so _apply_font_offset_to_tree always scales from the true originals.
+        _apply_font_offset_to_tree(central, 0)
 
     # ── Sidebar ────────────────────────────────────────────────────────────
 
@@ -7517,6 +8167,28 @@ class MainWindow(QMainWindow):
         self._calibration_view.calibrationChanged.connect(self._on_calibration_changed)
         self._calibration_view.hide()
         vb.addWidget(self._calibration_view, 1)
+
+        # Loading overlay — shown during background save parse, dismissed before UI population
+        self._loading_overlay = QWidget(w)
+        self._loading_overlay.setStyleSheet("background:#0a0a18;")
+        lo_vb = QVBoxLayout(self._loading_overlay)
+        lo_vb.setAlignment(Qt.AlignCenter)
+        self._loading_label = QLabel("Loading save file\u2026")
+        self._loading_label.setStyleSheet("color:#aaa; font-size:15px; font-weight:bold;")
+        self._loading_label.setAlignment(Qt.AlignCenter)
+        self._loading_bar = QProgressBar()
+        self._loading_bar.setFixedWidth(320)
+        self._loading_bar.setFixedHeight(16)
+        self._loading_bar.setRange(0, 0)  # indeterminate pulse
+        self._loading_bar.setTextVisible(False)
+        self._loading_bar.setStyleSheet(
+            "QProgressBar { background:#1a1a32; border:1px solid #2a2a4a; border-radius:4px; }"
+            "QProgressBar::chunk { background:#3f8f72; border-radius:3px; }"
+        )
+        lo_vb.addWidget(self._loading_label)
+        lo_vb.addSpacing(10)
+        lo_vb.addWidget(self._loading_bar, 0, Qt.AlignCenter)
+        self._loading_overlay.hide()
 
         return w
 
@@ -8067,6 +8739,104 @@ class MainWindow(QMainWindow):
             f"Calibration applied ({cal_explicit} explicit, {cal_token} token from {cal_rows} rows)"
         )
 
+    # ── Breeding cache ──────────────────────────────────────────────────
+
+    def _start_breeding_cache(self, cats: list[Cat], force_full: bool = False):
+        """Kick off background computation of the breeding cache."""
+        # Cancel any in-progress worker
+        if self._cache_worker is not None:
+            self._cache_worker.quit()
+            self._cache_worker.wait(500)
+            self._cache_worker = None
+
+        # Snapshot parent keys before clearing old cache (for incremental update)
+        prev_cache = self._breeding_cache if not force_full else None
+        prev_parent_keys = dict(self._prev_parent_keys) if hasattr(self, "_prev_parent_keys") and not force_full else {}
+
+        # Record current parent keys for next reload
+        self._prev_parent_keys = {
+            c.db_key: (
+                c.parent_a.db_key if c.parent_a is not None else None,
+                c.parent_b.db_key if c.parent_b is not None else None,
+            )
+            for c in cats
+        }
+
+        self._breeding_cache = None
+        self._cache_progress.setValue(0)
+        self._cache_progress.show()
+
+        # Try loading pairwise data from disk (skip if force_full)
+        existing = None
+        save_path = self._current_save or ""
+        if not force_full and save_path:
+            existing = BreedingCache.load_from_disk(save_path)
+            if existing is not None:
+                self._cache_progress.setFormat("Loading cached breeding data\u2026 %p%")
+            elif prev_cache is not None:
+                self._cache_progress.setFormat("Updating breeding data\u2026 %p%")
+            else:
+                self._cache_progress.setFormat("Computing breeding data\u2026 %p%")
+        else:
+            self._cache_progress.setFormat("Computing breeding data\u2026 %p%")
+
+        worker = BreedingCacheWorker(
+            cats, save_path=save_path, existing_pairwise=existing,
+            prev_cache=prev_cache, prev_parent_keys=prev_parent_keys,
+            parent=self,
+        )
+        worker.progress.connect(self._on_cache_progress)
+        worker.phase1_ready.connect(self._on_phase1_ready)
+        worker.finished_cache.connect(self._on_cache_ready)
+        worker.finished.connect(lambda: self._cache_progress.hide())
+        self._cache_worker = worker
+        worker.start()
+
+    def _on_cache_progress(self, current: int, total: int):
+        self._cache_progress.setMaximum(total)
+        self._cache_progress.setValue(current)
+
+    def _clear_breeding_cache(self):
+        """Delete the on-disk breeding cache for the current save file."""
+        if not self._current_save:
+            self.statusBar().showMessage("No save loaded — nothing to clear")
+            return
+        cp = _breeding_cache_path(self._current_save)
+        if os.path.exists(cp):
+            try:
+                os.remove(cp)
+                self.statusBar().showMessage("Breeding cache cleared — next load will recompute from scratch")
+            except OSError as e:
+                self.statusBar().showMessage(f"Could not delete cache: {e}")
+        else:
+            self.statusBar().showMessage("No on-disk breeding cache found for this save")
+
+    def _on_phase1_ready(self, cache: BreedingCache):
+        """Ancestry computed — push to table and Safe Breeding so they're usable immediately."""
+        self._breeding_cache = cache
+        self._source_model.set_breeding_cache(cache)
+        if self._safe_breeding_view is not None:
+            self._safe_breeding_view.set_cache(cache)
+        if self._perfect_planner_view is not None:
+            self._perfect_planner_view.set_cache(cache)
+        self._cache_progress.setFormat("Computing pair risks\u2026 %p%")
+
+    def _on_cache_ready(self, cache: BreedingCache):
+        self._breeding_cache = cache
+        self._cache_worker = None
+        self._cache_progress.hide()
+        # Push completed cache (now includes pairwise risk) to all views
+        self._source_model.set_breeding_cache(cache)
+        if self._safe_breeding_view is not None:
+            self._safe_breeding_view.set_cache(cache)
+        if self._room_optimizer_view is not None:
+            self._room_optimizer_view.set_cache(cache)
+        if self._perfect_planner_view is not None:
+            self._perfect_planner_view.set_cache(cache)
+        self.statusBar().showMessage(
+            self.statusBar().currentMessage() + "  |  Breeding cache ready"
+        )
+
     # ── Loading ────────────────────────────────────────────────────────────
 
     def load_save(self, path: str):
@@ -8075,12 +8845,40 @@ class MainWindow(QMainWindow):
             self._watcher.removePaths(self._watcher.files())
         self._watcher.addPath(path)
 
+        # Cancel any in-progress load
+        if self._save_load_worker is not None:
+            self._save_load_worker.quit()
+            self._save_load_worker.wait(500)
+            self._save_load_worker = None
+
+        # Show overlay while parsing (background thread — main thread stays responsive for repaint)
+        name = os.path.basename(path)
+        self._loading_label.setText(f"Loading {name}\u2026")
+        overlay = self._loading_overlay
+        parent = overlay.parentWidget()
+        if parent:
+            overlay.setGeometry(0, 0, parent.width(), parent.height())
+        overlay.raise_()
+        overlay.show()
+
+        worker = SaveLoadWorker(path, parent=self)
+        worker.finished_load.connect(self._on_save_loaded)
+        self._save_load_worker = worker
+        worker.start()
+
+    def _on_save_loaded(self, result: dict):
+        self._save_load_worker = None
+        # Dismiss overlay immediately — UI work below is fast (model.load is O(n), no ancestry)
+        self._loading_overlay.hide()
         try:
-            cats, errors = parse_save(path)
-            _load_blacklist(path, cats)
-            _load_must_breed(path, cats)
-            applied_overrides, override_rows = _load_gender_overrides(path, cats)
-            cal_explicit, cal_token, cal_rows = _apply_calibration(path, cats)
+            cats = result["cats"]
+            errors = result["errors"]
+            applied_overrides = result["applied_overrides"]
+            override_rows = result["override_rows"]
+            cal_explicit = result["cal_explicit"]
+            cal_token = result["cal_token"]
+            cal_rows = result["cal_rows"]
+
             self._cats = cats
             self._source_model.load(cats)
             self._rebuild_room_buttons(cats)
@@ -8098,22 +8896,24 @@ class MainWindow(QMainWindow):
             self._btn_adventure.setText(f"On Adventure  ({adv})")
             self._btn_gone.setText(f"Gone  ({gone})")
             self._filter(None, self._btn_all)
-            if self._tree_view is not None:
+            # Only push cats to currently visible views immediately.
+            # Hidden views call set_cats themselves when shown via _show_* methods.
+            if self._tree_view is not None and self._tree_view.isVisible():
                 self._tree_view.set_cats(cats)
-            if self._safe_breeding_view is not None:
+            if self._safe_breeding_view is not None and self._safe_breeding_view.isVisible():
                 self._safe_breeding_view.set_cats(cats)
-            if self._breeding_partners_view is not None:
+            if self._breeding_partners_view is not None and self._breeding_partners_view.isVisible():
                 self._breeding_partners_view.set_cats(cats)
-            if self._room_optimizer_view is not None:
+            if self._room_optimizer_view is not None and self._room_optimizer_view.isVisible():
                 self._room_optimizer_view.set_cats(cats)
-            if self._perfect_planner_view is not None:
+            if self._perfect_planner_view is not None and self._perfect_planner_view.isVisible():
                 self._perfect_planner_view.set_cats(cats)
-            if self._calibration_view is not None:
-                self._calibration_view.set_context(path, cats)
+            if self._calibration_view is not None and self._calibration_view.isVisible():
+                self._calibration_view.set_context(self._current_save, cats)
 
-            name = os.path.basename(path)
+            name = os.path.basename(self._current_save)
             self._save_lbl.setText(name)
-            self.setWindowTitle(f"Mewgenics Breeding Manager — {name}")
+            self.setWindowTitle(f"Mewgenics Breeding Manager \u2014 {name}")
 
             msg = f"Loaded {len(cats)} cats from {name}"
             if errors:
@@ -8123,6 +8923,9 @@ class MainWindow(QMainWindow):
             if cal_rows:
                 msg += f"  (calibration: {cal_explicit} explicit, {cal_token} token)"
             self.statusBar().showMessage(msg)
+
+            # Start background breeding cache computation
+            self._start_breeding_cache(cats)
         except Exception as e:
             import traceback
             print(traceback.format_exc())
@@ -8144,6 +8947,13 @@ class MainWindow(QMainWindow):
             "Save Files (*.sav);;All Files (*)")
         if path:
             self.load_save(path)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_loading_overlay") and self._loading_overlay.isVisible():
+            parent = self._loading_overlay.parentWidget()
+            if parent:
+                self._loading_overlay.setGeometry(0, 0, parent.width(), parent.height())
 
     def _reload(self):
         if self._current_save:
@@ -8209,14 +9019,34 @@ class MainWindow(QMainWindow):
     def _reset_zoom(self):
         self._set_zoom(100)
 
+    def _change_font_size(self, direction: int):
+        self._set_font_size_offset(self._font_size_offset + direction)
+
+    def _set_font_size_offset(self, offset: int):
+        clamped = max(-6, min(12, offset))
+        if clamped == self._font_size_offset:
+            return
+        self._font_size_offset = clamped
+        self._apply_zoom()
+        self._update_font_size_info_action()
+        label = f"+{clamped}pt" if clamped > 0 else f"{clamped}pt" if clamped < 0 else "default"
+        self.statusBar().showMessage(f"Font size offset: {label}")
+
+    def _update_font_size_info_action(self):
+        if hasattr(self, "_font_size_info_action"):
+            off = self._font_size_offset
+            label = f"+{off}pt" if off > 0 else f"{off}pt" if off < 0 else "default"
+            self._font_size_info_action.setText(f"Font size: {label}")
+
     def _apply_zoom(self):
         app = QApplication.instance()
         font = QFont(self._base_font)
         base_pt = self._base_font.pointSizeF()
         if base_pt > 0:
-            font.setPointSizeF(max(_ACCESSIBILITY_MIN_FONT_PT, base_pt * (self._zoom_percent / 100.0)))
+            zoomed_pt = base_pt * (self._zoom_percent / 100.0) + self._font_size_offset
+            font.setPointSizeF(max(_ACCESSIBILITY_MIN_FONT_PT, zoomed_pt))
         elif self._base_font.pixelSize() > 0:
-            font.setPixelSize(max(_ACCESSIBILITY_MIN_FONT_PX, self._scaled(self._base_font.pixelSize())))
+            font.setPixelSize(max(_ACCESSIBILITY_MIN_FONT_PX, self._scaled(self._base_font.pixelSize()) + self._font_size_offset))
         app.setFont(font)
 
         if hasattr(self, "_sidebar"):
@@ -8229,7 +9059,11 @@ class MainWindow(QMainWindow):
             for col, width in self._base_col_widths.items():
                 self._table.setColumnWidth(col, self._scaled(width))
             self._table.verticalHeader().setDefaultSectionSize(self._scaled(24))
-        _enforce_min_font_in_widget_tree(self)
+
+        # Scale all hardcoded stylesheet font-size values across the whole window.
+        # 1pt ≈ 1.33px; round to nearest integer pixel.
+        offset_px = round(self._font_size_offset * 1.333)
+        _apply_font_offset_to_tree(self, offset_px)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -8275,6 +9109,85 @@ def _ensure_gpak_path_interactive(parent: Optional[QWidget] = None):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+class SaveSelectorDialog(QDialog):
+    """Startup dialog for picking which save file to load."""
+
+    def __init__(self, saves: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mewgenics Breeding Manager — Select Save")
+        self.setFixedSize(520, 360)
+        self.setStyleSheet(
+            "QDialog { background:#0d0d1c; }"
+            "QLabel { color:#ccc; }"
+            "QListWidget { background:#101023; color:#ddd; border:1px solid #26264a;"
+            " font-size:13px; }"
+            "QListWidget::item { padding:6px; }"
+            "QListWidget::item:selected { background:#1e3060; }"
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72;"
+            " border-radius:4px; padding:8px 20px; font-size:12px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+            "QPushButton:disabled { background:#1a1a32; color:#555; border-color:#2a2a4a; }"
+        )
+        self._selected_path: Optional[str] = None
+
+        vb = QVBoxLayout(self)
+        vb.setContentsMargins(16, 16, 16, 16)
+        vb.setSpacing(12)
+
+        title = QLabel("Select a save file to open")
+        title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
+        vb.addWidget(title)
+
+        self._list = QListWidget()
+        for path in saves:
+            name = os.path.basename(path)
+            folder = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            mtime = os.path.getmtime(path)
+            ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            item = QListWidgetItem(f"{name}  ({folder})  —  {ts}")
+            item.setData(Qt.UserRole, path)
+            self._list.addItem(item)
+        self._list.setCurrentRow(0)
+        self._list.itemDoubleClicked.connect(lambda _: self._accept())
+        vb.addWidget(self._list, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._open_btn = QPushButton("Open")
+        self._open_btn.clicked.connect(self._accept)
+        self._open_btn.setEnabled(len(saves) > 0)
+        btn_row.addWidget(self._open_btn)
+
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setStyleSheet(
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        browse_btn.clicked.connect(self._browse)
+        btn_row.addWidget(browse_btn)
+        vb.addLayout(btn_row)
+
+    def _accept(self):
+        cur = self._list.currentItem()
+        if cur is not None:
+            self._selected_path = cur.data(Qt.UserRole)
+            self.accept()
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Mewgenics Save File",
+            str(Path.home()),
+            "Save Files (*.sav);;All Files (*)",
+        )
+        if path:
+            self._selected_path = path
+            self.accept()
+
+    @property
+    def selected_path(self) -> Optional[str]:
+        return self._selected_path
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -8302,7 +9215,17 @@ def main():
         )
         _ensure_gpak_path_interactive()
 
-    win = MainWindow()
+    # Show save selector before opening main window
+    saves = find_save_files()
+    initial_save: Optional[str] = None
+    if saves:
+        dlg = SaveSelectorDialog(saves)
+        if dlg.exec() == QDialog.Accepted:
+            initial_save = dlg.selected_path
+        else:
+            return 0  # User cancelled
+
+    win = MainWindow(initial_save=initial_save)
     win.show()
     return app.exec()
 
