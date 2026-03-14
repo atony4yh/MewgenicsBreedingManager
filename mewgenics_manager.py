@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
     QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
     QTableWidget, QTableWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QComboBox, QMessageBox, QSpinBox, QProgressBar, QTabWidget,
+    QComboBox, QCompleter, QMessageBox, QSpinBox, QProgressBar, QTabWidget,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -7567,6 +7567,773 @@ def _sidebar_btn(label: str) -> QPushButton:
     return btn
 
 
+# ── Mutation & Disorder Breeding Planner ──────────────────────────────────────
+
+class MutationDisorderPlannerView(QWidget):
+    """View for planning breeding around specific mutations, disorders, and passives."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QWidget { background:#0a0a18; }"
+            "QLabel { color:#bbb; }"
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; }"
+            "QHeaderView::section { background:#151532; color:#7d8bb0; border:none; padding:4px; font-weight:bold; }"
+            "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:hover { background:#252545; color:#ddd; }"
+        )
+        self._cats: list[Cat] = []
+        self._selected_pair: list[Cat] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("Mutation & Disorder Breeding Planner")
+        title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
+        header.addWidget(title)
+        header.addStretch()
+        root.addLayout(header)
+
+        # Controls row
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        controls.addWidget(QLabel("Room:"))
+        self._room_combo = QComboBox()
+        self._room_combo.setFixedWidth(200)
+        self._room_combo.setStyleSheet(
+            "QComboBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        self._room_combo.currentIndexChanged.connect(self._refresh_table)
+        controls.addWidget(self._room_combo)
+        controls.addSpacing(16)
+        controls.addWidget(QLabel("Stimulation:"))
+        self._stim_spin = QSpinBox()
+        self._stim_spin.setRange(0, 100)
+        self._stim_spin.setValue(50)
+        self._stim_spin.setFixedWidth(60)
+        self._stim_spin.setStyleSheet(
+            "QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px; }"
+        )
+        self._stim_spin.valueChanged.connect(self._on_stim_changed)
+        controls.addWidget(self._stim_spin)
+        controls.addStretch()
+        self._pair_label = QLabel("Ctrl+click two cats to compare breeding outcomes")
+        self._pair_label.setStyleSheet("color:#666; font-size:11px;")
+        controls.addWidget(self._pair_label)
+        root.addLayout(controls)
+
+        # Target trait row
+        trait_row = QHBoxLayout()
+        trait_row.setSpacing(8)
+        trait_row.addWidget(QLabel("Target Trait:"))
+        self._trait_combo = QComboBox()
+        self._trait_combo.setFixedWidth(300)
+        self._trait_combo.setEditable(True)
+        self._trait_combo.setInsertPolicy(QComboBox.NoInsert)
+        self._trait_combo.lineEdit().setPlaceholderText("Type to search...")
+        self._trait_combo.setStyleSheet(
+            "QComboBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+            "QComboBox QLineEdit { background:#0d0d1c; color:#ccc; border:none; }"
+        )
+        completer = QCompleter()
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        completer.setMaxVisibleItems(15)
+        self._trait_combo.setCompleter(completer)
+        self._trait_combo.currentIndexChanged.connect(self._on_target_trait_changed)
+        trait_row.addWidget(self._trait_combo)
+        self._trait_info_label = QLabel("")
+        self._trait_info_label.setStyleSheet("color:#666; font-size:11px;")
+        trait_row.addWidget(self._trait_info_label)
+        trait_row.addStretch()
+        root.addLayout(trait_row)
+
+        # Main splitter: cat table left, outcome panel right
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setStyleSheet("QSplitter::handle { background:#26264a; width:3px; }")
+
+        # Left: cat table
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+        self._cat_table = QTableWidget(0, 6)
+        self._cat_table.setHorizontalHeaderLabels([
+            "Name", "Gender", "Age", "Mutations", "Passives / Disorders", "Abilities",
+        ])
+        self._cat_table.verticalHeader().setVisible(False)
+        self._cat_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._cat_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._cat_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._cat_table.setSortingEnabled(True)
+        self._cat_table.setAlternatingRowColors(True)
+        hh = self._cat_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self._cat_table.setColumnWidth(0, 130)
+        self._cat_table.setColumnWidth(1, 50)
+        self._cat_table.setColumnWidth(2, 40)
+        self._cat_table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        left_layout.addWidget(self._cat_table)
+        splitter.addWidget(left)
+
+        # Right: outcome panel
+        self._outcome_scroll = QScrollArea()
+        self._outcome_scroll.setWidgetResizable(True)
+        self._outcome_scroll.setFrameShape(QFrame.NoFrame)
+        self._outcome_scroll.setStyleSheet("QScrollArea { border:none; background:#0a0a18; }")
+        self._outcome_widget = QWidget()
+        self._outcome_layout = QVBoxLayout(self._outcome_widget)
+        self._outcome_layout.setContentsMargins(12, 8, 12, 8)
+        self._outcome_layout.setSpacing(6)
+        self._outcome_placeholder = QLabel("Select two cats to see breeding outcome analysis.")
+        self._outcome_placeholder.setStyleSheet("color:#555; font-size:12px;")
+        self._outcome_placeholder.setWordWrap(True)
+        self._outcome_layout.addWidget(self._outcome_placeholder)
+        self._outcome_layout.addStretch()
+        self._outcome_scroll.setWidget(self._outcome_widget)
+        splitter.addWidget(self._outcome_scroll)
+
+        splitter.setSizes([500, 500])
+        root.addWidget(splitter, 1)
+
+    def set_cats(self, cats: list[Cat]):
+        self._cats = cats
+        self._selected_pair.clear()
+        self._populate_room_filter()
+        self._populate_trait_combo()
+        self._refresh_table()
+
+    def _populate_room_filter(self):
+        self._room_combo.blockSignals(True)
+        self._room_combo.clear()
+        self._room_combo.addItem("All Rooms", "")
+        rooms: dict[str, str] = {}
+        for cat in self._cats:
+            if cat.status == "Gone" or not cat.room or cat.room == "Adventure":
+                continue
+            if cat.room not in rooms:
+                rooms[cat.room] = ROOM_DISPLAY.get(cat.room, cat.room)
+        for raw, display in sorted(rooms.items(), key=lambda kv: kv[1]):
+            self._room_combo.addItem(display, raw)
+        self._room_combo.blockSignals(False)
+
+    def _populate_trait_combo(self):
+        self._trait_combo.blockSignals(True)
+        prev = self._trait_combo.currentData()
+        self._trait_combo.clear()
+        self._trait_combo.addItem("(none -- select a trait to plan for)", None)
+
+        # Collect all traits across all alive cats, grouped by category
+        mutations: dict[str, str] = {}   # raw -> display
+        passives: dict[str, str] = {}
+        abilities: dict[str, str] = {}
+
+        for cat in self._cats:
+            if cat.status == "Gone":
+                continue
+            for m in (cat.mutations or []):
+                key = m.lower()
+                if key not in mutations:
+                    mutations[key] = _mutation_display_name(m)
+            for p in (cat.passive_abilities or []):
+                key = p.lower()
+                if key not in passives:
+                    passives[key] = _mutation_display_name(p)
+            for a in (cat.abilities or []):
+                key = a.lower()
+                if key not in abilities:
+                    abilities[key] = _mutation_display_name(a)
+
+        if mutations:
+            self._trait_combo.insertSeparator(self._trait_combo.count())
+            for key in sorted(mutations, key=lambda k: mutations[k]):
+                self._trait_combo.addItem(
+                    f"[Mutation] {mutations[key]}", ("mutation", key)
+                )
+        if passives:
+            self._trait_combo.insertSeparator(self._trait_combo.count())
+            for key in sorted(passives, key=lambda k: passives[k]):
+                self._trait_combo.addItem(
+                    f"[Passive/Disorder] {passives[key]}", ("passive", key)
+                )
+        if abilities:
+            self._trait_combo.insertSeparator(self._trait_combo.count())
+            for key in sorted(abilities, key=lambda k: abilities[k]):
+                self._trait_combo.addItem(
+                    f"[Ability] {abilities[key]}", ("ability", key)
+                )
+
+        # Restore previous selection if still present
+        if prev is not None:
+            for i in range(self._trait_combo.count()):
+                if self._trait_combo.itemData(i) == prev:
+                    self._trait_combo.setCurrentIndex(i)
+                    break
+        self._trait_combo.blockSignals(False)
+
+    def _on_target_trait_changed(self):
+        data = self._trait_combo.currentData()
+        if data is None:
+            self._trait_info_label.setText("")
+            # If a pair is selected, show pair outcome; otherwise show placeholder
+            if len(self._selected_pair) == 2:
+                self._update_outcome_panel(self._selected_pair[0], self._selected_pair[1])
+            else:
+                self._clear_outcome_panel()
+            return
+        # Clear cat table selection so the two modes don't conflict
+        self._cat_table.clearSelection()
+        self._selected_pair.clear()
+        self._pair_label.setText("Ctrl+click two cats to compare breeding outcomes")
+        self._pair_label.setStyleSheet("color:#666; font-size:11px;")
+        self._update_trait_plan(data)
+
+    def _update_trait_plan(self, trait_data: tuple):
+        """Show breeding plan for the selected target trait."""
+        category, trait_key = trait_data
+        stim = self._stim_spin.value()
+
+        # Find all alive cats that have this trait
+        carriers: list[Cat] = []
+        for cat in self._cats:
+            if cat.status == "Gone":
+                continue
+            if category == "mutation":
+                if any(m.lower() == trait_key for m in (cat.mutations or [])):
+                    carriers.append(cat)
+            elif category == "passive":
+                if any(p.lower() == trait_key for p in (cat.passive_abilities or [])):
+                    carriers.append(cat)
+            elif category == "ability":
+                if any(a.lower() == trait_key for a in (cat.abilities or [])):
+                    carriers.append(cat)
+
+        # Display name for the trait
+        trait_display = self._trait_combo.currentText()
+        self._trait_info_label.setText(f"{len(carriers)} carrier(s) found")
+        self._trait_info_label.setStyleSheet(
+            f"color:{'#8fb8a0' if carriers else '#cc6666'}; font-size:11px;"
+        )
+
+        # Clear and rebuild outcome panel
+        layout = self._outcome_layout
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        layout.addWidget(self._sec_label(f"Breeding Plan: {trait_display}"))
+
+        # ── Carriers ──
+        layout.addWidget(self._sec_label(f"Carriers ({len(carriers)} cats)"))
+        if not carriers:
+            layout.addWidget(self._info_label("No living cats have this trait."))
+            layout.addStretch()
+            return
+
+        carrier_table = QTableWidget(len(carriers), 4)
+        carrier_table.setHorizontalHeaderLabels(["Name", "Gender", "Age", "Room"])
+        carrier_table.verticalHeader().setVisible(False)
+        carrier_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        carrier_table.setSelectionMode(QAbstractItemView.NoSelection)
+        carrier_table.setMaximumHeight(min(30 + len(carriers) * 26, 250))
+        carrier_table.setStyleSheet(
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
+        )
+        chh = carrier_table.horizontalHeader()
+        chh.setSectionResizeMode(0, QHeaderView.Stretch)
+        chh.setSectionResizeMode(1, QHeaderView.Fixed)
+        chh.setSectionResizeMode(2, QHeaderView.Fixed)
+        chh.setSectionResizeMode(3, QHeaderView.Stretch)
+        carrier_table.setColumnWidth(1, 50)
+        carrier_table.setColumnWidth(2, 40)
+        for row, cat in enumerate(carriers):
+            carrier_table.setItem(row, 0, QTableWidgetItem(cat.name))
+            g_item = QTableWidgetItem(cat.gender_display if hasattr(cat, 'gender_display') else cat.gender)
+            g_item.setTextAlignment(Qt.AlignCenter)
+            carrier_table.setItem(row, 1, g_item)
+            a_item = QTableWidgetItem(str(cat.age) if cat.age is not None else "-")
+            a_item.setTextAlignment(Qt.AlignCenter)
+            carrier_table.setItem(row, 2, a_item)
+            room_name = ROOM_DISPLAY.get(cat.room, cat.room) if cat.room else "-"
+            carrier_table.setItem(row, 3, QTableWidgetItem(room_name))
+        layout.addWidget(carrier_table)
+
+        # ── Inheritance mechanics ──
+        layout.addWidget(self._sec_label("Inheritance Mechanics"))
+        if category == "mutation":
+            favor_weight = _stimulation_inheritance_weight(stim)
+            layout.addWidget(self._info_label(
+                f"Visual mutations: 80% chance all parts inherited. "
+                f"Mutated part favored at {favor_weight*100:.1f}% (stim {stim}).\n\n"
+                "Strategy: Breed a carrier with any cat. The offspring has a high "
+                "chance of inheriting the mutated body part(s) from the carrier parent."
+            ))
+        elif category == "passive":
+            passive_chance = 0.05 + 0.01 * stim
+            layout.addWidget(self._info_label(
+                f"Passive/disorder inheritance: {min(passive_chance, 1.0)*100:.1f}% "
+                f"chance per breeding (stim {stim}), 50/50 parent pick.\n"
+                f"If both parents carry it: ~{min(passive_chance, 1.0)*100:.1f}% chance, "
+                "but either parent can pass it.\n"
+                "Disorders specifically: 15% flat chance from each parent.\n\n"
+                "Strategy: Pair two carriers together for the best odds. "
+                "If only one carrier exists, breed them and hope for inheritance, "
+                "then breed carriers from the next generation together."
+            ))
+        elif category == "ability":
+            spell_chance = 0.2 + 0.025 * stim
+            layout.addWidget(self._info_label(
+                f"Spell/ability inheritance: {min(spell_chance, 1.0)*100:.1f}% "
+                f"chance per breeding (stim {stim}), 50/50 parent pick.\n\n"
+                "Strategy: Breed a carrier with any cat. If both parents have the "
+                "ability, either can pass it."
+            ))
+
+        # ── Recommended pairs ──
+        layout.addWidget(self._sec_label("Recommended Breeding Pairs"))
+
+        males = [c for c in carriers if c.gender and c.gender.upper() in ("M", "MALE")]
+        females = [c for c in carriers if c.gender and c.gender.upper() in ("F", "FEMALE")]
+        non_carriers = [c for c in self._cats if c.status != "Gone" and c not in carriers]
+        nc_males = [c for c in non_carriers if c.gender and c.gender.upper() in ("M", "MALE")]
+        nc_females = [c for c in non_carriers if c.gender and c.gender.upper() in ("F", "FEMALE")]
+
+        pairs: list[tuple[Cat, Cat, str]] = []  # (cat_a, cat_b, note)
+
+        # Best: carrier x carrier (opposite gender)
+        for m in males:
+            for f in females:
+                if m is f:
+                    continue
+                inbred_a = m.inbredness if m.inbredness is not None else 0.0
+                inbred_b = f.inbredness if f.inbredness is not None else 0.0
+                avg_inbred = (inbred_a + inbred_b) / 2.0
+                note = "Both carriers"
+                if avg_inbred > 0.2:
+                    note += f" (inbreeding {avg_inbred:.0%} -- birth defect risk)"
+                pairs.append((m, f, note))
+
+        # Good: carrier x non-carrier (opposite gender)
+        if len(pairs) < 10:
+            for carrier in carriers:
+                pool = nc_females if carrier.gender and carrier.gender.upper() in ("M", "MALE") else nc_males
+                for partner in pool[:5]:  # limit to avoid huge lists
+                    pairs.append((carrier, partner, "One carrier"))
+                    if len(pairs) >= 15:
+                        break
+                if len(pairs) >= 15:
+                    break
+
+        if not pairs:
+            if len(carriers) == 1:
+                layout.addWidget(self._info_label(
+                    f"Only one carrier ({carriers[0].name}). "
+                    "Breed with any opposite-gender cat and select this trait again "
+                    "after offspring are born to find new carriers."
+                ))
+            else:
+                layout.addWidget(self._info_label(
+                    "No opposite-gender pairs found among carriers or available cats."
+                ))
+        else:
+            pair_table = QTableWidget(len(pairs), 4)
+            pair_table.setHorizontalHeaderLabels(["Parent A", "Parent B", "Note", "Inbreeding"])
+            pair_table.verticalHeader().setVisible(False)
+            pair_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            pair_table.setSelectionMode(QAbstractItemView.NoSelection)
+            pair_table.setMaximumHeight(min(30 + len(pairs) * 26, 400))
+            pair_table.setStyleSheet(
+                "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
+            )
+            phh = pair_table.horizontalHeader()
+            phh.setSectionResizeMode(0, QHeaderView.Stretch)
+            phh.setSectionResizeMode(1, QHeaderView.Stretch)
+            phh.setSectionResizeMode(2, QHeaderView.Stretch)
+            phh.setSectionResizeMode(3, QHeaderView.Fixed)
+            pair_table.setColumnWidth(3, 80)
+            for row, (ca, cb, note) in enumerate(pairs):
+                pair_table.setItem(row, 0, QTableWidgetItem(ca.name))
+                pair_table.setItem(row, 1, QTableWidgetItem(cb.name))
+                pair_table.setItem(row, 2, QTableWidgetItem(note))
+                inbred_a = ca.inbredness if ca.inbredness is not None else 0.0
+                inbred_b = cb.inbredness if cb.inbredness is not None else 0.0
+                avg = (inbred_a + inbred_b) / 2.0
+                inbred_item = QTableWidgetItem(f"{avg:.0%}")
+                inbred_item.setTextAlignment(Qt.AlignCenter)
+                if avg > 0.2:
+                    inbred_item.setForeground(QColor("#cc6666"))
+                pair_table.setItem(row, 3, inbred_item)
+            layout.addWidget(pair_table)
+
+        layout.addStretch()
+
+    def _filtered_cats(self) -> list[Cat]:
+        room_filter = self._room_combo.currentData() or ""
+        result = []
+        for cat in self._cats:
+            if cat.status == "Gone":
+                continue
+            if room_filter and cat.room != room_filter:
+                continue
+            result.append(cat)
+        return result
+
+    def _refresh_table(self):
+        self._cat_table.setSortingEnabled(False)
+        cats = self._filtered_cats()
+        self._cat_table.setRowCount(len(cats))
+        for row, cat in enumerate(cats):
+            name_item = QTableWidgetItem(cat.name)
+            name_item.setData(Qt.UserRole, id(cat))
+            self._cat_table.setItem(row, 0, name_item)
+
+            gender_item = QTableWidgetItem(cat.gender_display if hasattr(cat, 'gender_display') else cat.gender)
+            gender_item.setTextAlignment(Qt.AlignCenter)
+            self._cat_table.setItem(row, 1, gender_item)
+
+            age_item = QTableWidgetItem(str(cat.age) if cat.age is not None else "—")
+            age_item.setData(Qt.UserRole, cat.age if cat.age is not None else -1)
+            age_item.setTextAlignment(Qt.AlignCenter)
+            self._cat_table.setItem(row, 2, age_item)
+
+            muts = ", ".join(_mutation_display_name(m) for m in cat.mutations) if cat.mutations else "—"
+            self._cat_table.setItem(row, 3, QTableWidgetItem(muts))
+
+            passives = ", ".join(_mutation_display_name(p) for p in cat.passive_abilities) if cat.passive_abilities else "—"
+            self._cat_table.setItem(row, 4, QTableWidgetItem(passives))
+
+            abils = ", ".join(_mutation_display_name(a) for a in cat.abilities) if cat.abilities else "—"
+            self._cat_table.setItem(row, 5, QTableWidgetItem(abils))
+        self._cat_table.setSortingEnabled(True)
+
+    def _on_stim_changed(self):
+        trait_data = self._trait_combo.currentData()
+        if trait_data is not None:
+            self._update_trait_plan(trait_data)
+        elif len(self._selected_pair) == 2:
+            self._update_outcome_panel(self._selected_pair[0], self._selected_pair[1])
+
+    def _on_selection_changed(self):
+        rows = sorted(set(idx.row() for idx in self._cat_table.selectionModel().selectedRows()))
+        cats_by_id = {id(c): c for c in self._cats}
+        selected: list[Cat] = []
+        for r in rows:
+            item = self._cat_table.item(r, 0)
+            if item is None:
+                continue
+            cat_id = item.data(Qt.UserRole)
+            cat = cats_by_id.get(cat_id)
+            if cat is not None:
+                selected.append(cat)
+
+        if len(selected) == 2:
+            self._selected_pair = selected
+            self._pair_label.setText(f"Pair: {selected[0].name} \u00d7 {selected[1].name}")
+            self._pair_label.setStyleSheet("color:#8fb8a0; font-size:11px; font-weight:bold;")
+            # Clear trait dropdown so pair view takes over
+            self._trait_combo.blockSignals(True)
+            self._trait_combo.setCurrentIndex(0)
+            self._trait_combo.blockSignals(False)
+            self._trait_info_label.setText("")
+            self._update_outcome_panel(selected[0], selected[1])
+        elif len(selected) == 1:
+            self._selected_pair = selected
+            self._pair_label.setText(f"Selected: {selected[0].name} -- select one more")
+            self._pair_label.setStyleSheet("color:#aa8; font-size:11px;")
+            if self._trait_combo.currentData() is None:
+                self._clear_outcome_panel()
+        else:
+            self._selected_pair.clear()
+            self._pair_label.setText("Ctrl+click two cats to compare breeding outcomes")
+            self._pair_label.setStyleSheet("color:#666; font-size:11px;")
+            if self._trait_combo.currentData() is None:
+                self._clear_outcome_panel()
+
+    def _clear_outcome_panel(self):
+        layout = self._outcome_layout
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        self._outcome_placeholder = QLabel("Select two cats to see breeding outcome analysis.")
+        self._outcome_placeholder.setStyleSheet("color:#555; font-size:12px;")
+        self._outcome_placeholder.setWordWrap(True)
+        layout.addWidget(self._outcome_placeholder)
+        layout.addStretch()
+
+    def _sec_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#7d8bb0; font-size:13px; font-weight:bold; padding:4px 0 2px 0;")
+        return lbl
+
+    def _info_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#bbb; font-size:11px;")
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _update_outcome_panel(self, cat_a: Cat, cat_b: Cat):
+        layout = self._outcome_layout
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        stim = self._stim_spin.value()
+        favor_weight = _stimulation_inheritance_weight(stim)
+
+        # ── Header ──
+        layout.addWidget(self._sec_label(
+            f"{cat_a.name} \u00d7 {cat_b.name}"
+        ))
+
+        # ── Disorder Inheritance ──
+        layout.addWidget(self._sec_label("Disorder Inheritance"))
+        layout.addWidget(self._info_label(
+            "Each parent has a flat 15% chance per disorder to pass it down."
+        ))
+
+        a_passives = cat_a.passive_abilities or []
+        b_passives = cat_b.passive_abilities or []
+
+        disorder_rows: list[str] = []
+        seen = set()
+        for p in a_passives:
+            name = _mutation_display_name(p)
+            key = p.lower()
+            if key not in seen:
+                seen.add(key)
+                # Check if other parent also has it
+                b_has = any(bp.lower() == key for bp in b_passives)
+                if b_has:
+                    pct = 1.0 - (0.85 * 0.85)  # both parents: ~27.75%
+                    disorder_rows.append(f"  {name}: {pct*100:.1f}% (both parents)")
+                else:
+                    disorder_rows.append(f"  {name}: 15% (from {cat_a.name})")
+        for p in b_passives:
+            key = p.lower()
+            if key not in seen:
+                seen.add(key)
+                name = _mutation_display_name(p)
+                disorder_rows.append(f"  {name}: 15% (from {cat_b.name})")
+
+        if disorder_rows:
+            layout.addWidget(self._info_label("\n".join(disorder_rows)))
+        else:
+            layout.addWidget(self._info_label("  Neither parent has passives/disorders to pass."))
+
+        # Birth defect risk
+        inbred_a = cat_a.inbredness if cat_a.inbredness is not None else 0.0
+        inbred_b = cat_b.inbredness if cat_b.inbredness is not None else 0.0
+        # Approximate offspring inbreeding from parents
+        avg_inbred = (inbred_a + inbred_b) / 2.0
+        birth_defect_chance = 0.02 + 0.4 * max(0.0, min(avg_inbred - 0.2, 1.0))
+        birth_defect_chance = min(birth_defect_chance, 1.0)
+        inbred_note = ""
+        if cat_a.inbredness is None and cat_b.inbredness is None:
+            inbred_note = " (parent inbreeding unknown, assuming 0)"
+        layout.addWidget(self._info_label(
+            f"  Birth defect disorder chance: {birth_defect_chance*100:.1f}%{inbred_note}\n"
+            f"  (if offspring inherits < 2 disorders)"
+        ))
+
+        note_lbl = QLabel(
+            "Note: Save data does not distinguish passives from disorders.\n"
+            "All passive_abilities entries are shown. Refer to game knowledge\n"
+            "to identify which are disorders."
+        )
+        note_lbl.setStyleSheet("color:#665; font-size:10px; font-style:italic;")
+        note_lbl.setWordWrap(True)
+        layout.addWidget(note_lbl)
+
+        # ── Visual Mutation Inheritance ──
+        layout.addWidget(self._sec_label("Mutation Inheritance (Visual Parts)"))
+        layout.addWidget(self._info_label(
+            f"80% chance all parts are inherited. Stimulation {stim}: "
+            f"mutated parts favored at {favor_weight*100:.1f}%."
+        ))
+
+        # Group mutations by group_key
+        a_by_group: dict[str, list[dict]] = {}
+        for entry in (cat_a.visual_mutation_entries or []):
+            gk = entry.get("group_key", "")
+            a_by_group.setdefault(gk, []).append(entry)
+        b_by_group: dict[str, list[dict]] = {}
+        for entry in (cat_b.visual_mutation_entries or []):
+            gk = entry.get("group_key", "")
+            b_by_group.setdefault(gk, []).append(entry)
+
+        all_groups = sorted(set(list(a_by_group.keys()) + list(b_by_group.keys())))
+        if all_groups:
+            mut_table = QTableWidget(len(all_groups), 4)
+            mut_table.setHorizontalHeaderLabels(["Body Part", cat_a.name, cat_b.name, "Odds"])
+            mut_table.verticalHeader().setVisible(False)
+            mut_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            mut_table.setSelectionMode(QAbstractItemView.NoSelection)
+            mut_table.setMaximumHeight(min(30 + len(all_groups) * 26, 300))
+            mut_table.setStyleSheet(
+                "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
+            )
+            mhh = mut_table.horizontalHeader()
+            mhh.setSectionResizeMode(0, QHeaderView.Interactive)
+            mhh.setSectionResizeMode(1, QHeaderView.Stretch)
+            mhh.setSectionResizeMode(2, QHeaderView.Stretch)
+            mhh.setSectionResizeMode(3, QHeaderView.Interactive)
+            mut_table.setColumnWidth(0, 100)
+            mut_table.setColumnWidth(3, 120)
+
+            for row, gk in enumerate(all_groups):
+                a_entries = a_by_group.get(gk, [])
+                b_entries = b_by_group.get(gk, [])
+                part_label = a_entries[0].get("part_label", gk) if a_entries else (
+                    b_entries[0].get("part_label", gk) if b_entries else gk
+                )
+                a_names = ", ".join(e.get("name", "?") for e in a_entries) or "Base"
+                b_names = ", ".join(e.get("name", "?") for e in b_entries) or "Base"
+
+                a_has_mutation = bool(a_entries)
+                b_has_mutation = bool(b_entries)
+
+                if a_has_mutation and b_has_mutation:
+                    if a_names == b_names:
+                        odds_text = "Same mutation"
+                    else:
+                        odds_text = f"{cat_a.name}: 50% / {cat_b.name}: 50%"
+                elif a_has_mutation:
+                    odds_text = f"Mutated ({cat_a.name}): {favor_weight*100:.0f}%"
+                elif b_has_mutation:
+                    odds_text = f"Mutated ({cat_b.name}): {favor_weight*100:.0f}%"
+                else:
+                    odds_text = "No mutations"
+
+                mut_table.setItem(row, 0, QTableWidgetItem(part_label))
+                mut_table.setItem(row, 1, QTableWidgetItem(a_names))
+                mut_table.setItem(row, 2, QTableWidgetItem(b_names))
+                mut_table.setItem(row, 3, QTableWidgetItem(odds_text))
+
+            layout.addWidget(mut_table)
+        else:
+            layout.addWidget(self._info_label("  No visual mutations on either parent."))
+
+        # ── Passive Inheritance ──
+        layout.addWidget(self._sec_label("Passive / Ability Inheritance"))
+        passive_chance = 0.05 + 0.01 * stim
+        spell_chance = 0.2 + 0.025 * stim
+        layout.addWidget(self._info_label(
+            f"Passive inheritance chance: {min(passive_chance, 1.0)*100:.1f}% "
+            f"(50/50 parent pick)\n"
+            f"Spell inheritance chance: {min(spell_chance, 1.0)*100:.1f}% "
+            f"(50/50 parent pick)"
+        ))
+
+        if a_passives or b_passives:
+            chips, share_a, share_b = _inheritance_candidates(
+                a_passives, b_passives, stim, _mutation_display_name,
+            )
+            passive_lines = []
+            for label, tip in chips:
+                passive_lines.append(f"  {label}")
+            if passive_lines:
+                layout.addWidget(self._info_label(
+                    "If a passive IS inherited, weighted odds per entry:\n" +
+                    "\n".join(passive_lines)
+                ))
+
+        if cat_a.abilities or cat_b.abilities:
+            spell_chips, _, _ = _inheritance_candidates(
+                cat_a.abilities or [], cat_b.abilities or [],
+                stim, _mutation_display_name,
+            )
+            spell_lines = []
+            for label, tip in spell_chips:
+                spell_lines.append(f"  {label}")
+            if spell_lines:
+                layout.addWidget(self._info_label(
+                    "If a spell IS inherited, weighted odds per entry:\n" +
+                    "\n".join(spell_lines)
+                ))
+
+        # ── Stat Inheritance ──
+        layout.addWidget(self._sec_label("Stat Inheritance"))
+        layout.addWidget(self._info_label(
+            f"Better stat favored at {favor_weight*100:.1f}% (stim {stim})."
+        ))
+
+        stat_table = QTableWidget(7, 4)
+        stat_table.setHorizontalHeaderLabels(["Stat", cat_a.name, cat_b.name, "Offspring likely"])
+        stat_table.verticalHeader().setVisible(False)
+        stat_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        stat_table.setSelectionMode(QAbstractItemView.NoSelection)
+        stat_table.setMaximumHeight(30 + 7 * 26)
+        stat_table.setStyleSheet(
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
+        )
+        shh = stat_table.horizontalHeader()
+        shh.setSectionResizeMode(0, QHeaderView.Fixed)
+        shh.setSectionResizeMode(1, QHeaderView.Fixed)
+        shh.setSectionResizeMode(2, QHeaderView.Fixed)
+        shh.setSectionResizeMode(3, QHeaderView.Stretch)
+        stat_table.setColumnWidth(0, 40)
+        stat_table.setColumnWidth(1, 60)
+        stat_table.setColumnWidth(2, 60)
+
+        for row, stat_name in enumerate(STAT_NAMES):
+            a_val = cat_a.base_stats.get(stat_name, 0)
+            b_val = cat_b.base_stats.get(stat_name, 0)
+            if a_val == b_val:
+                likely = f"{a_val} (same)"
+            elif a_val > b_val:
+                likely = f"{a_val} ({favor_weight*100:.0f}%) or {b_val} ({(1-favor_weight)*100:.0f}%)"
+            else:
+                likely = f"{b_val} ({favor_weight*100:.0f}%) or {a_val} ({(1-favor_weight)*100:.0f}%)"
+
+            stat_table.setItem(row, 0, QTableWidgetItem(stat_name))
+            a_item = QTableWidgetItem(str(a_val))
+            a_item.setTextAlignment(Qt.AlignCenter)
+            stat_table.setItem(row, 1, a_item)
+            b_item = QTableWidgetItem(str(b_val))
+            b_item.setTextAlignment(Qt.AlignCenter)
+            stat_table.setItem(row, 2, b_item)
+            stat_table.setItem(row, 3, QTableWidgetItem(likely))
+
+        layout.addWidget(stat_table)
+
+        # ── Lineage Info ──
+        layout.addWidget(self._sec_label("Lineage"))
+        lineage_lines = []
+        for label, cat in [(cat_a.name, cat_a), (cat_b.name, cat_b)]:
+            pa_name = cat.parent_a.name if cat.parent_a else "Unknown"
+            pb_name = cat.parent_b.name if cat.parent_b else "Unknown"
+            inbred_str = f"{cat.inbredness:.2f}" if cat.inbredness is not None else "?"
+            lineage_lines.append(f"{label}: parents = {pa_name} \u00d7 {pb_name}, inbreeding = {inbred_str}")
+
+            # Show grandparent disorders if available
+            for gp_label, gp in [("  GP", cat.parent_a), ("  GP", cat.parent_b)]:
+                if gp is not None and gp.passive_abilities:
+                    gp_passives = ", ".join(_mutation_display_name(p) for p in gp.passive_abilities)
+                    lineage_lines.append(f"    {gp.name} passives: {gp_passives}")
+
+        layout.addWidget(self._info_label("\n".join(lineage_lines)))
+
+        layout.addStretch()
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -7650,20 +8417,29 @@ class MainWindow(QMainWindow):
         fm = self.menuBar().addMenu("File")
         self._file_menu = fm
 
-        oa = QAction("Open Save File…", self)
+        oa = QAction("Open Save File...", self)
         oa.setShortcut("Ctrl+O")
         oa.triggered.connect(self._open_file)
         fm.addAction(oa)
 
-        self._set_default_save_action = QAction("Set Current as Default Save", self)
+        # Recent Saves submenu
+        self._recent_saves_menu = fm.addMenu("Recent Saves")
+        self._recent_save_actions: list[QAction] = []
+        self._refresh_recent_save_actions()
+
+        fm.addSeparator()
+
+        # Default Save submenu
+        default_menu = fm.addMenu("Default Save")
+        self._set_default_save_action = QAction("Set Current as Default", self)
         self._set_default_save_action.triggered.connect(self._set_current_as_default)
         self._set_default_save_action.setEnabled(False)
-        fm.addAction(self._set_default_save_action)
+        default_menu.addAction(self._set_default_save_action)
 
-        self._clear_default_save_action = QAction("Clear Default Save", self)
+        self._clear_default_save_action = QAction("Clear Default", self)
         self._clear_default_save_action.triggered.connect(self._clear_default_save)
         self._clear_default_save_action.setEnabled(False)
-        fm.addAction(self._clear_default_save_action)
+        default_menu.addAction(self._clear_default_save_action)
 
         fm.addSeparator()
 
@@ -7689,10 +8465,6 @@ class MainWindow(QMainWindow):
         exit_action.setShortcut("Alt+F4")
         exit_action.triggered.connect(self.close)
         fm.addAction(exit_action)
-
-        self._recent_saves_separator = fm.addSeparator()
-        self._recent_save_actions: list[QAction] = []
-        self._refresh_recent_save_actions()
 
         sm = self.menuBar().addMenu("Settings")
         locations_action = QAction("Locations…", self)
@@ -7760,17 +8532,16 @@ class MainWindow(QMainWindow):
         self._update_font_size_info_action()
 
     def _refresh_recent_save_actions(self):
-        if not hasattr(self, "_file_menu"):
+        if not hasattr(self, "_recent_saves_menu"):
             return
-        for action in getattr(self, "_recent_save_actions", []):
-            self._file_menu.removeAction(action)
+        self._recent_saves_menu.clear()
         self._recent_save_actions = []
 
         saves = find_save_files()
         if not saves:
             action = QAction(f"No saves found in {_save_root_dir()}", self)
             action.setEnabled(False)
-            self._file_menu.addAction(action)
+            self._recent_saves_menu.addAction(action)
             self._recent_save_actions.append(action)
             return
 
@@ -7778,7 +8549,7 @@ class MainWindow(QMainWindow):
             action = QAction(os.path.basename(path), self)
             action.setToolTip(path)
             action.triggered.connect(lambda _, p=path: self.load_save(p))
-            self._file_menu.addAction(action)
+            self._recent_saves_menu.addAction(action)
             self._recent_save_actions.append(action)
 
     def _open_locations_dialog(self):
@@ -7917,7 +8688,7 @@ class MainWindow(QMainWindow):
                             " letter-spacing:1px; padding:8px 4px 4px 4px;")
             return l
 
-        vb.addWidget(sl("VIEW"))
+        vb.addWidget(sl("FILTERS"))
         self._btn_everyone = _sidebar_btn("All Cats")
         self._btn_everyone.clicked.connect(
             lambda: self._filter("__all__", self._btn_everyone))
@@ -7953,18 +8724,26 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_donation)
         self._room_btns["__donation__"] = self._btn_donation
 
+        vb.addWidget(_hsep())
+        vb.addWidget(sl("BREEDING"))
         self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
         self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
         vb.addWidget(self._btn_room_optimizer)
         self._btn_perfect_planner = _sidebar_btn("Perfect 7 Planner")
         self._btn_perfect_planner.clicked.connect(self._open_perfect_planner_view)
         vb.addWidget(self._btn_perfect_planner)
+        self._btn_mutation_planner = _sidebar_btn("Mutation Planner")
+        self._btn_mutation_planner.clicked.connect(self._open_mutation_planner_view)
+        vb.addWidget(self._btn_mutation_planner)
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
         self._btn_safe_breeding_view.clicked.connect(self._open_safe_breeding_view)
         vb.addWidget(self._btn_safe_breeding_view)
         self._btn_breeding_partners_view = _sidebar_btn("Breeding Partners")
         self._btn_breeding_partners_view.clicked.connect(self._open_breeding_partners_view)
         vb.addWidget(self._btn_breeding_partners_view)
+
+        vb.addWidget(_hsep())
+        vb.addWidget(sl("INFO"))
         self._btn_tree_view = _sidebar_btn("Family Tree View")
         self._btn_tree_view.clicked.connect(self._open_tree_browser)
         vb.addWidget(self._btn_tree_view)
@@ -8228,6 +9007,9 @@ class MainWindow(QMainWindow):
         self._calibration_view.calibrationChanged.connect(self._on_calibration_changed)
         self._calibration_view.hide()
         vb.addWidget(self._calibration_view, 1)
+        self._mutation_planner_view = MutationDisorderPlannerView(self)
+        self._mutation_planner_view.hide()
+        vb.addWidget(self._mutation_planner_view, 1)
 
         # Loading overlay — shown during background save parse, dismissed before UI population
         self._loading_overlay = QWidget(w)
@@ -8517,6 +9299,8 @@ class MainWindow(QMainWindow):
             self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if hasattr(self, "_header"):
             self._header.show()
         if hasattr(self, "_table_view_container"):
@@ -8533,6 +9317,8 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_tree_view(self):
         if self._active_btn is not None:
@@ -8552,6 +9338,8 @@ class MainWindow(QMainWindow):
             self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if self._tree_view is not None:
             self._tree_view.set_cats(self._cats)
             self._tree_view.show()
@@ -8567,6 +9355,8 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_safe_breeding_view(self):
         if self._active_btn is not None:
@@ -8586,6 +9376,8 @@ class MainWindow(QMainWindow):
             self._perfect_planner_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if self._safe_breeding_view is not None:
             self._safe_breeding_view.set_cats(self._cats)
             self._safe_breeding_view.show()
@@ -8601,6 +9393,8 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_breeding_partners_view(self):
         if self._active_btn is not None:
@@ -8618,6 +9412,8 @@ class MainWindow(QMainWindow):
             self._room_optimizer_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if self._breeding_partners_view is not None:
             self._breeding_partners_view.set_cats(self._cats)
             self._breeding_partners_view.show()
@@ -8629,8 +9425,12 @@ class MainWindow(QMainWindow):
             self._btn_breeding_partners_view.setChecked(True)
         if hasattr(self, "_btn_room_optimizer"):
             self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_room_optimizer_view(self):
         if self._active_btn is not None:
@@ -8650,6 +9450,8 @@ class MainWindow(QMainWindow):
             self._calibration_view.hide()
         if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
             self._perfect_planner_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if self._room_optimizer_view is not None:
             self._room_optimizer_view.set_cats(self._cats)
             self._room_optimizer_view.show()
@@ -8665,6 +9467,8 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_perfect_planner_view(self):
         if self._active_btn is not None:
@@ -8684,6 +9488,8 @@ class MainWindow(QMainWindow):
             self._room_optimizer_view.hide()
         if hasattr(self, "_calibration_view") and self._calibration_view is not None:
             self._calibration_view.hide()
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
         if self._perfect_planner_view is not None:
             self._perfect_planner_view.set_cats(self._cats)
             self._perfect_planner_view.show()
@@ -8699,6 +9505,8 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(True)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
 
     def _show_calibration_view(self):
         if self._active_btn is not None:
@@ -8734,6 +9542,48 @@ class MainWindow(QMainWindow):
             self._btn_perfect_planner.setChecked(False)
         if hasattr(self, "_btn_calibration"):
             self._btn_calibration.setChecked(True)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(False)
+        if hasattr(self, "_mutation_planner_view") and self._mutation_planner_view is not None:
+            self._mutation_planner_view.hide()
+
+    def _show_mutation_planner_view(self):
+        if self._active_btn is not None:
+            self._active_btn.setChecked(False)
+        self._active_btn = None
+        if hasattr(self, "_header"):
+            self._header.hide()
+        if hasattr(self, "_table_view_container"):
+            self._table_view_container.hide()
+        if hasattr(self, "_tree_view") and self._tree_view is not None:
+            self._tree_view.hide()
+        if hasattr(self, "_safe_breeding_view") and self._safe_breeding_view is not None:
+            self._safe_breeding_view.hide()
+        if hasattr(self, "_breeding_partners_view") and self._breeding_partners_view is not None:
+            self._breeding_partners_view.hide()
+        if hasattr(self, "_room_optimizer_view") and self._room_optimizer_view is not None:
+            self._room_optimizer_view.hide()
+        if hasattr(self, "_perfect_planner_view") and self._perfect_planner_view is not None:
+            self._perfect_planner_view.hide()
+        if hasattr(self, "_calibration_view") and self._calibration_view is not None:
+            self._calibration_view.hide()
+        if self._mutation_planner_view is not None:
+            self._mutation_planner_view.set_cats(self._cats)
+            self._mutation_planner_view.show()
+        if hasattr(self, "_btn_tree_view"):
+            self._btn_tree_view.setChecked(False)
+        if hasattr(self, "_btn_safe_breeding_view"):
+            self._btn_safe_breeding_view.setChecked(False)
+        if hasattr(self, "_btn_breeding_partners_view"):
+            self._btn_breeding_partners_view.setChecked(False)
+        if hasattr(self, "_btn_room_optimizer"):
+            self._btn_room_optimizer.setChecked(False)
+        if hasattr(self, "_btn_perfect_planner"):
+            self._btn_perfect_planner.setChecked(False)
+        if hasattr(self, "_btn_calibration"):
+            self._btn_calibration.setChecked(False)
+        if hasattr(self, "_btn_mutation_planner"):
+            self._btn_mutation_planner.setChecked(True)
 
     def _update_header(self, room_key):
         if room_key == "__all__":
@@ -9020,7 +9870,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_lineage(self, checked: bool):
         self._show_lineage = checked
-        for col in (COL_AGE, COL_SRC):
+        for col in (COL_GEN_DEPTH, COL_SRC):
             self._table.setColumnHidden(col, not checked)
         self._source_model.set_show_lineage(checked)
         self._detail.set_show_lineage(checked)
@@ -9081,6 +9931,9 @@ class MainWindow(QMainWindow):
 
     def _open_calibration_view(self):
         self._show_calibration_view()
+
+    def _open_mutation_planner_view(self):
+        self._show_mutation_planner_view()
 
     # ── UI zoom ───────────────────────────────────────────────────────────
 
