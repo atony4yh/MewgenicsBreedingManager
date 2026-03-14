@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QFrame, QDialog, QGridLayout, QSizePolicy,
     QLineEdit, QListWidget, QListWidgetItem, QScrollArea, QToolButton,
     QTableWidget, QTableWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QComboBox, QCompleter, QMessageBox, QSpinBox, QProgressBar, QTabWidget,
+    QComboBox, QMessageBox, QSpinBox, QProgressBar, QTabWidget,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel,
@@ -7634,24 +7634,26 @@ class MutationDisorderPlannerView(QWidget):
         trait_row = QHBoxLayout()
         trait_row.setSpacing(8)
         trait_row.addWidget(QLabel("Target Trait:"))
+        self._trait_search = QLineEdit()
+        self._trait_search.setPlaceholderText("Type to filter...")
+        self._trait_search.setFixedWidth(160)
+        self._trait_search.setClearButtonEnabled(True)
+        self._trait_search.setStyleSheet(
+            "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+            " border-radius:4px; padding:4px 8px; }"
+        )
+        self._trait_search.textChanged.connect(self._on_trait_search_changed)
+        trait_row.addWidget(self._trait_search)
         self._trait_combo = QComboBox()
         self._trait_combo.setFixedWidth(300)
-        self._trait_combo.setEditable(True)
-        self._trait_combo.setInsertPolicy(QComboBox.NoInsert)
-        self._trait_combo.lineEdit().setPlaceholderText("Type to search...")
         self._trait_combo.setStyleSheet(
             "QComboBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
             " border-radius:4px; padding:4px 8px; }"
-            "QComboBox QLineEdit { background:#0d0d1c; color:#ccc; border:none; }"
         )
-        completer = QCompleter()
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchContains)
-        completer.setCompletionMode(QCompleter.PopupCompletion)
-        completer.setMaxVisibleItems(15)
-        self._trait_combo.setCompleter(completer)
         self._trait_combo.currentIndexChanged.connect(self._on_target_trait_changed)
         trait_row.addWidget(self._trait_combo)
+        # Master list of (display_text, user_data) for filtering
+        self._trait_items_master: list[tuple[str, object]] = []
         self._trait_info_label = QLabel("")
         self._trait_info_label.setStyleSheet("color:#666; font-size:11px;")
         trait_row.addWidget(self._trait_info_label)
@@ -7733,10 +7735,7 @@ class MutationDisorderPlannerView(QWidget):
         self._room_combo.blockSignals(False)
 
     def _populate_trait_combo(self):
-        self._trait_combo.blockSignals(True)
         prev = self._trait_combo.currentData()
-        self._trait_combo.clear()
-        self._trait_combo.addItem("(none -- select a trait to plan for)", None)
 
         # Collect all traits across all alive cats, grouped by category
         mutations: dict[str, str] = {}   # raw -> display
@@ -7759,29 +7758,50 @@ class MutationDisorderPlannerView(QWidget):
                 if key not in abilities:
                     abilities[key] = _mutation_display_name(a)
 
-        if mutations:
-            self._trait_combo.insertSeparator(self._trait_combo.count())
-            for key in sorted(mutations, key=lambda k: mutations[k]):
-                self._trait_combo.addItem(
-                    f"[Mutation] {mutations[key]}", ("mutation", key)
-                )
-        if passives:
-            self._trait_combo.insertSeparator(self._trait_combo.count())
-            for key in sorted(passives, key=lambda k: passives[k]):
-                self._trait_combo.addItem(
-                    f"[Passive/Disorder] {passives[key]}", ("passive", key)
-                )
-        if abilities:
-            self._trait_combo.insertSeparator(self._trait_combo.count())
-            for key in sorted(abilities, key=lambda k: abilities[k]):
-                self._trait_combo.addItem(
-                    f"[Ability] {abilities[key]}", ("ability", key)
-                )
+        # Build master list: (display_text, user_data)
+        self._trait_items_master = []
+        for key in sorted(mutations, key=lambda k: mutations[k]):
+            self._trait_items_master.append(
+                (f"[Mutation] {mutations[key]}", ("mutation", key))
+            )
+        for key in sorted(passives, key=lambda k: passives[k]):
+            self._trait_items_master.append(
+                (f"[Passive/Disorder] {passives[key]}", ("passive", key))
+            )
+        for key in sorted(abilities, key=lambda k: abilities[k]):
+            self._trait_items_master.append(
+                (f"[Ability] {abilities[key]}", ("ability", key))
+            )
+
+        self._trait_search.clear()
+        self._apply_trait_filter("", prev)
+
+    def _on_trait_search_changed(self, text: str):
+        prev = self._trait_combo.currentData()
+        self._apply_trait_filter(text, prev)
+
+    def _apply_trait_filter(self, search: str, restore_data=None):
+        self._trait_combo.blockSignals(True)
+        self._trait_combo.clear()
+        self._trait_combo.addItem("(none -- select a trait to plan for)", None)
+
+        needle = search.strip().lower()
+        last_category = None
+        for display_text, user_data in self._trait_items_master:
+            if needle and needle not in display_text.lower():
+                continue
+            # Insert category separator when category changes
+            category = user_data[0] if isinstance(user_data, tuple) else None
+            if category != last_category:
+                if last_category is not None:
+                    self._trait_combo.insertSeparator(self._trait_combo.count())
+                last_category = category
+            self._trait_combo.addItem(display_text, user_data)
 
         # Restore previous selection if still present
-        if prev is not None:
+        if restore_data is not None:
             for i in range(self._trait_combo.count()):
-                if self._trait_combo.itemData(i) == prev:
+                if self._trait_combo.itemData(i) == restore_data:
                     self._trait_combo.setCurrentIndex(i)
                     break
         self._trait_combo.blockSignals(False)
