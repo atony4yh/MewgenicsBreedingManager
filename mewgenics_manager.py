@@ -2305,15 +2305,21 @@ def _parse_pedigree(conn) -> dict:
 
     # Entries start at offset 8 (after a single u64 header), stride 32
     for pos in range(8, len(data) - 31, 32):
-        cat_k, pa_k, pb_k, _ = struct.unpack_from('<QQQQ', data, pos)
+        cat_k, pa_k, pb_k, extra = struct.unpack_from('<QQQQ', data, pos)
         if cat_k == 0 or cat_k == NULL or cat_k > MAX_KEY:
             continue
         pa = int(pa_k) if pa_k != NULL and 0 < pa_k <= MAX_KEY else None
         pb = int(pb_k) if pb_k != NULL and 0 < pb_k <= MAX_KEY else None
-        # First occurrence of each cat_k is the parent record; later occurrences
-        # are other relationship types (breeding history, etc.) — skip them.
-        if int(cat_k) not in ped_map:
-            ped_map[int(cat_k)] = (pa, pb)
+        cat_key = int(cat_k)
+
+        existing = ped_map.get(cat_key)
+        if existing is None:
+            # No entry yet — take whatever we have
+            ped_map[cat_key] = (pa, pb)
+        elif existing[0] is None or existing[1] is None:
+            # Existing entry is incomplete — upgrade if this one is better
+            if pa is not None and pb is not None:
+                ped_map[cat_key] = (pa, pb)
 
     return ped_map
 
