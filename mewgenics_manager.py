@@ -1500,22 +1500,38 @@ class Cat:
             self.abilities = [x for x in run_items[1:6] if _valid_str(x)]
 
             # Passive mutations: item[10] then 3 tail tier-entries
+            # For cats that haven't adventured yet, the run may be shorter
+            # (< 11 items), so also harvest any valid items from run_items[10:]
             passives: list[str] = []
-            if len(run_items) > 10 and _valid_str(run_items[10]):
-                passives.append(run_items[10])
+            for ri in run_items[10:]:
+                if _valid_str(ri):
+                    passives.append(ri)
 
+            # After run items, try reading tier-prefixed tail entries
+            # (passive1 tier, then up to 3 more: Passive2, Disorder1, Disorder2)
             try:
                 r.u32()   # passive1 tier — discard
             except Exception:
                 pass
 
+            consecutive_misses = 0
             for _ in range(3):   # Passive2, Disorder1, Disorder2
                 saved = r.pos
                 item = r.str()
                 if item is None or not _IDENT_RE.match(item) or not _valid_str(item):
                     r.seek(saved)
-                    break
-                passives.append(item)
+                    consecutive_misses += 1
+                    if consecutive_misses >= 2:
+                        break
+                    # Try skipping past a potential empty slot (u64 string header + u32 tier)
+                    try:
+                        r.skip(12)
+                    except Exception:
+                        break
+                    continue
+                consecutive_misses = 0
+                if item not in passives:  # avoid duplicates from run_items
+                    passives.append(item)
                 try:
                     r.u32()   # tier — discard
                 except Exception:
@@ -4908,6 +4924,8 @@ class RoomOptimizerView(QWidget):
         self._cats: list[Cat] = []
         self._cache: Optional[BreedingCache] = None
         self._optimizer_worker: Optional[RoomOptimizerWorker] = None
+        self._planner_view: Optional['MutationDisorderPlannerView'] = None
+        self._planner_traits: list[dict] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -5054,6 +5072,20 @@ class RoomOptimizerView(QWidget):
         self._bind_persistent_toggle(self._prefer_high_libido_checkbox, "Prefer High Libido", "prefer_high_libido")
         controls.addWidget(self._prefer_high_libido_checkbox)
 
+        controls.addSpacing(16)
+        self._import_planner_btn = QPushButton("Import Breeding Planner")
+        self._import_planner_btn.setToolTip(
+            "Import weighted trait selections from the Mutation & Disorder Planner.\n"
+            "The optimizer will boost pairs that carry the selected traits."
+        )
+        self._import_planner_btn.setStyleSheet(
+            "QPushButton { background:#2a2a5a; color:#bbbbee; border:1px solid #4a4a8a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:hover { background:#3a3a6a; color:#ddd; }"
+        )
+        self._import_planner_btn.clicked.connect(self._import_from_planner)
+        controls.addWidget(self._import_planner_btn)
+
         controls.addStretch()
         controls_wrap.setWidget(controls_box)
         root.addWidget(controls_wrap)
@@ -5153,6 +5185,28 @@ class RoomOptimizerView(QWidget):
     def set_cache(self, cache: Optional['BreedingCache']):
         self._cache = cache
 
+    def set_planner_view(self, planner: 'MutationDisorderPlannerView'):
+        self._planner_view = planner
+
+    def _import_from_planner(self):
+        if self._planner_view is None:
+            return
+        self._planner_traits = self._planner_view.get_selected_traits()
+        if not self._planner_traits:
+            self._import_planner_btn.setText("Import Breeding Planner")
+            self._import_planner_btn.setToolTip("No traits selected in the planner. Select traits first.")
+            return
+        names = [f"{t['display'].split('] ')[-1]}({t['weight']})" for t in self._planner_traits[:4]]
+        summary = ", ".join(names)
+        if len(self._planner_traits) > 4:
+            summary += f" +{len(self._planner_traits) - 4} more"
+        self._import_planner_btn.setText(f"Imported: {summary}")
+        self._import_planner_btn.setStyleSheet(
+            "QPushButton { background:#2a3a5a; color:#aaddff; border:1px solid #4a6a9a; "
+            "border-radius:4px; padding:6px 12px; font-size:11px; }"
+            "QPushButton:hover { background:#3a4a6a; color:#ddd; }"
+        )
+
     def _calculate_optimal_distribution(self):
         """Kick off background optimizer worker."""
         if self._optimizer_worker is not None and self._optimizer_worker.isRunning():
@@ -5180,6 +5234,7 @@ class RoomOptimizerView(QWidget):
             "prefer_low_aggression": self._prefer_low_aggression_checkbox.isChecked(),
             "prefer_high_libido": self._prefer_high_libido_checkbox.isChecked(),
             "mode_family": self._mode_toggle_btn.isChecked(),
+            "planner_traits": list(self._planner_traits),
         }
 
         self._optimize_btn.setEnabled(False)
@@ -5446,6 +5501,9 @@ class RoomOptimizerWorker(QThread):
             ok, _, risk = _pair_eval(a, b)
             return ok and risk > max_risk
 
+        # ── Planner trait bonus ──
+        planner_traits = p.get("planner_traits", [])
+
         males   = sorted([c for c in alive_cats if c.gender == "male"],   key=lambda c: stat_sum[c.db_key], reverse=True)
         females = sorted([c for c in alive_cats if c.gender == "female"], key=lambda c: stat_sum[c.db_key], reverse=True)
         unknown = sorted([c for c in alive_cats if c.gender == "?"],      key=lambda c: stat_sum[c.db_key], reverse=True)
@@ -5561,7 +5619,18 @@ class RoomOptimizerWorker(QThread):
                     for s in STAT_NAMES if minimize_variance and abs(cat_a.base_stats[s] - cat_b.base_stats[s]) > 2
                 )
                 personality_bonus = _personality_score(cat_a, cat_b) * 2.5
-                quality = (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0) - variance_penalty + personality_bonus
+                # Planner trait bonus: reward pairs that carry desired traits
+                trait_bonus = 0.0
+                if planner_traits:
+                    for t in planner_traits:
+                        a_has = _cat_has_trait(cat_a, t["category"], t["key"])
+                        b_has = _cat_has_trait(cat_b, t["category"], t["key"])
+                        wf = t["weight"] / 10.0
+                        if a_has or b_has:
+                            trait_bonus += wf * 5.0
+                            if a_has and b_has:
+                                trait_bonus += wf * 2.5
+                quality = (avg_base_stats + complementarity_bonus) * (1.0 - risk / 200.0) - variance_penalty + personality_bonus + trait_bonus
                 must_breed_bonus = 1000 if (cat_a.must_breed or cat_b.must_breed) else 0
                 lover_bonus = 0.0 if avoid_lovers else (500.0 if _is_mutual_lover_pair(cat_a, cat_b) else 0.0)
                 pairs_with_scores.append({
@@ -7595,6 +7664,17 @@ def _sidebar_btn(label: str) -> QPushButton:
 
 # ── Mutation & Disorder Breeding Planner ──────────────────────────────────────
 
+def _cat_has_trait(cat: 'Cat', category: str, trait_key: str) -> bool:
+    """Check whether *cat* carries the given trait (mutation/passive/ability)."""
+    if category == "mutation":
+        return any(m.lower() == trait_key for m in (cat.mutations or []))
+    elif category == "passive":
+        return any(p.lower() == trait_key for p in (cat.passive_abilities or []))
+    elif category == "ability":
+        return any(a.lower() == trait_key for a in (cat.abilities or []))
+    return False
+
+
 class MutationDisorderPlannerView(QWidget):
     """View for planning breeding around specific mutations, disorders, and passives."""
 
@@ -7611,6 +7691,7 @@ class MutationDisorderPlannerView(QWidget):
         )
         self._cats: list[Cat] = []
         self._selected_pair: list[Cat] = []
+        self._selected_traits: list[dict] = []  # [{category, key, display, weight}]
         self._build_ui()
 
     def _build_ui(self):
@@ -7678,6 +7759,16 @@ class MutationDisorderPlannerView(QWidget):
         )
         self._trait_combo.currentIndexChanged.connect(self._on_target_trait_changed)
         trait_row.addWidget(self._trait_combo)
+        # "Add" button to add selected trait to the multi-select list
+        self._add_trait_btn = QPushButton("Add")
+        self._add_trait_btn.setFixedWidth(50)
+        self._add_trait_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:4px; padding:4px 8px; font-size:11px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+        )
+        self._add_trait_btn.clicked.connect(self._on_add_trait)
+        trait_row.addWidget(self._add_trait_btn)
         # Master list of (display_text, user_data) for filtering
         self._trait_items_master: list[tuple[str, object]] = []
         self._trait_info_label = QLabel("")
@@ -7719,7 +7810,60 @@ class MutationDisorderPlannerView(QWidget):
         left_layout.addWidget(self._cat_table)
         splitter.addWidget(left)
 
-        # Right: outcome panel
+        # Right: vertical splitter with selected traits (top) + outcome (bottom)
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setStyleSheet("QSplitter::handle { background:#26264a; height:3px; }")
+
+        # -- Selected traits panel --
+        traits_panel = QWidget()
+        traits_panel.setStyleSheet("QWidget { background:#0e0e20; }")
+        traits_panel_layout = QVBoxLayout(traits_panel)
+        traits_panel_layout.setContentsMargins(8, 6, 8, 6)
+        traits_panel_layout.setSpacing(4)
+        traits_header = QHBoxLayout()
+        traits_title = QLabel("Selected Traits")
+        traits_title.setStyleSheet("color:#8fb8a0; font-size:12px; font-weight:bold;")
+        traits_header.addWidget(traits_title)
+        traits_header.addStretch()
+        self._clear_traits_btn = QPushButton("Clear All")
+        self._clear_traits_btn.setFixedHeight(22)
+        self._clear_traits_btn.setStyleSheet(
+            "QPushButton { background:#2a1a1a; color:#c88; border:1px solid #4a2a2a; "
+            "border-radius:3px; padding:2px 8px; font-size:10px; }"
+            "QPushButton:hover { background:#3a2a2a; }"
+        )
+        self._clear_traits_btn.clicked.connect(self._on_clear_all_traits)
+        traits_header.addWidget(self._clear_traits_btn)
+        self._find_pairs_btn = QPushButton("Find Best Pairs")
+        self._find_pairs_btn.setFixedHeight(22)
+        self._find_pairs_btn.setStyleSheet(
+            "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
+            "border-radius:3px; padding:2px 8px; font-size:10px; font-weight:bold; }"
+            "QPushButton:hover { background:#26735a; }"
+        )
+        self._find_pairs_btn.clicked.connect(self._on_find_best_pairs)
+        traits_header.addWidget(self._find_pairs_btn)
+        traits_panel_layout.addLayout(traits_header)
+        # Scroll area for trait rows
+        self._traits_list_widget = QWidget()
+        self._traits_list_layout = QVBoxLayout(self._traits_list_widget)
+        self._traits_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._traits_list_layout.setSpacing(2)
+        self._traits_list_layout.addStretch()
+        traits_scroll = QScrollArea()
+        traits_scroll.setWidgetResizable(True)
+        traits_scroll.setFrameShape(QFrame.NoFrame)
+        traits_scroll.setStyleSheet("QScrollArea { border:none; background:transparent; }")
+        traits_scroll.setWidget(self._traits_list_widget)
+        traits_scroll.setMaximumHeight(200)
+        traits_panel_layout.addWidget(traits_scroll)
+        self._traits_empty_label = QLabel("No traits selected. Use the combo box above and click Add.")
+        self._traits_empty_label.setStyleSheet("color:#555; font-size:10px;")
+        self._traits_empty_label.setWordWrap(True)
+        traits_panel_layout.addWidget(self._traits_empty_label)
+        right_splitter.addWidget(traits_panel)
+
+        # -- Outcome panel --
         self._outcome_scroll = QScrollArea()
         self._outcome_scroll.setWidgetResizable(True)
         self._outcome_scroll.setFrameShape(QFrame.NoFrame)
@@ -7728,13 +7872,16 @@ class MutationDisorderPlannerView(QWidget):
         self._outcome_layout = QVBoxLayout(self._outcome_widget)
         self._outcome_layout.setContentsMargins(12, 8, 12, 8)
         self._outcome_layout.setSpacing(6)
-        self._outcome_placeholder = QLabel("Select two cats to see breeding outcome analysis.")
+        self._outcome_placeholder = QLabel("Select two cats to see breeding outcome analysis,\nor add traits above and click 'Find Best Pairs'.")
         self._outcome_placeholder.setStyleSheet("color:#555; font-size:12px;")
         self._outcome_placeholder.setWordWrap(True)
         self._outcome_layout.addWidget(self._outcome_placeholder)
         self._outcome_layout.addStretch()
         self._outcome_scroll.setWidget(self._outcome_widget)
-        splitter.addWidget(self._outcome_scroll)
+        right_splitter.addWidget(self._outcome_scroll)
+
+        right_splitter.setSizes([180, 420])
+        splitter.addWidget(right_splitter)
 
         splitter.setSizes([500, 500])
         root.addWidget(splitter, 1)
@@ -7849,8 +7996,262 @@ class MutationDisorderPlannerView(QWidget):
         self._pair_label.setStyleSheet("color:#666; font-size:11px;")
         self._update_trait_plan(data)
 
+    # ── Multi-select trait management ──
+
+    def _on_add_trait(self):
+        """Add the currently selected trait from the combo to the selected list."""
+        data = self._trait_combo.currentData()
+        if data is None:
+            return
+        category, key = data
+        # Check for duplicates
+        if any(t["category"] == category and t["key"] == key for t in self._selected_traits):
+            return
+        display = self._trait_combo.currentText()
+        self._selected_traits.append({
+            "category": category, "key": key, "display": display, "weight": 5,
+        })
+        self._rebuild_traits_list()
+
+    def _on_clear_all_traits(self):
+        self._selected_traits.clear()
+        self._rebuild_traits_list()
+        self._clear_outcome_panel()
+
+    def _on_remove_trait(self, index: int):
+        if 0 <= index < len(self._selected_traits):
+            self._selected_traits.pop(index)
+            self._rebuild_traits_list()
+
+    def _on_trait_weight_changed(self, index: int, value: int):
+        if 0 <= index < len(self._selected_traits):
+            self._selected_traits[index]["weight"] = value
+
+    def _rebuild_traits_list(self):
+        """Rebuild the selected traits list UI."""
+        layout = self._traits_list_layout
+        # Clear all widgets except the stretch at the end
+        while layout.count() > 1:
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        self._traits_empty_label.setVisible(len(self._selected_traits) == 0)
+
+        for i, trait in enumerate(self._selected_traits):
+            row = QWidget()
+            row.setStyleSheet("QWidget { background:#151530; border-radius:3px; }")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(6, 2, 4, 2)
+            row_layout.setSpacing(6)
+
+            lbl = QLabel(trait["display"])
+            lbl.setStyleSheet("color:#ccc; font-size:10px;")
+            lbl.setMinimumWidth(100)
+            row_layout.addWidget(lbl, 1)
+
+            wt_label = QLabel("Wt:")
+            wt_label.setStyleSheet("color:#888; font-size:10px;")
+            row_layout.addWidget(wt_label)
+
+            spin = QSpinBox()
+            spin.setRange(1, 10)
+            spin.setValue(trait["weight"])
+            spin.setFixedWidth(45)
+            spin.setStyleSheet(
+                "QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+                " border-radius:3px; padding:1px; font-size:10px; }"
+            )
+            idx = i  # capture for lambda
+            spin.valueChanged.connect(lambda v, ii=idx: self._on_trait_weight_changed(ii, v))
+            row_layout.addWidget(spin)
+
+            remove_btn = QPushButton("X")
+            remove_btn.setFixedSize(20, 20)
+            remove_btn.setStyleSheet(
+                "QPushButton { background:#2a1a1a; color:#c88; border:none; "
+                "border-radius:3px; font-size:10px; font-weight:bold; }"
+                "QPushButton:hover { background:#3a2a2a; }"
+            )
+            remove_btn.clicked.connect(lambda _, ii=idx: self._on_remove_trait(ii))
+            row_layout.addWidget(remove_btn)
+
+            layout.insertWidget(layout.count() - 1, row)  # insert before stretch
+
+    def _on_find_best_pairs(self):
+        """Find the best breeding pairs to cover all selected traits."""
+        if not self._selected_traits:
+            return
+        self._cat_table.clearSelection()
+        self._selected_pair.clear()
+        self._pair_label.setText("Ctrl+click two cats to compare breeding outcomes")
+        self._pair_label.setStyleSheet("color:#666; font-size:11px;")
+        self._trait_combo.blockSignals(True)
+        self._trait_combo.setCurrentIndex(0)
+        self._trait_combo.blockSignals(False)
+        self._trait_info_label.setText("")
+        self._update_multi_trait_plan()
+
+    def _update_multi_trait_plan(self):
+        """Show breeding plan for multiple selected traits with weights."""
+        stim = self._stim_spin.value()
+        traits = self._selected_traits
+
+        # Get all alive cats
+        alive = [c for c in self._cats if c.status != "Gone"]
+
+        # Score each cat: how many of the selected traits does it carry?
+        def _cat_score(cat):
+            return sum(t["weight"] for t in traits if _cat_has_trait(cat, t["category"], t["key"]))
+
+        # Generate all candidate pairs (opposite gender or unknown)
+        males = [c for c in alive if c.gender and c.gender.lower() == "male"]
+        females = [c for c in alive if c.gender and c.gender.lower() == "female"]
+        unknown = [c for c in alive if c.gender and c.gender.lower() == "?"]
+
+        candidate_pairs = (
+            [(a, b) for a in males for b in females]
+            + [(a, b) for a in males for b in unknown]
+            + [(a, b) for a in females for b in unknown]
+            + [(unknown[i], unknown[j]) for i in range(len(unknown)) for j in range(i + 1, len(unknown))]
+        )
+
+        max_possible = sum(t["weight"] for t in traits)
+        # With both-parents bonus: max is weight * 1.5 per trait
+        max_score_with_bonus = max_possible * 1.5
+
+        scored_pairs: list[tuple] = []
+        for a, b in candidate_pairs:
+            score = 0.0
+            covered = []
+            uncovered = []
+            for t in traits:
+                a_has = _cat_has_trait(a, t["category"], t["key"])
+                b_has = _cat_has_trait(b, t["category"], t["key"])
+                if a_has or b_has:
+                    score += t["weight"]
+                    if a_has and b_has:
+                        score += t["weight"] * 0.5  # bonus for both carriers
+                    covered.append(t)
+                else:
+                    uncovered.append(t)
+            if score > 0:
+                inbred_a = a.inbredness if a.inbredness is not None else 0.0
+                inbred_b = b.inbredness if b.inbredness is not None else 0.0
+                avg_inbred = (inbred_a + inbred_b) / 2.0
+                scored_pairs.append((score, a, b, covered, uncovered, avg_inbred))
+
+        scored_pairs.sort(key=lambda x: (-x[0], x[5]))  # best score, lowest inbreeding
+
+        # Build outcome panel
+        layout = self._outcome_layout
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        layout.addWidget(self._sec_label(
+            f"Multi-Trait Breeding Plan ({len(traits)} traits, max weight {max_possible})"
+        ))
+
+        if not scored_pairs:
+            layout.addWidget(self._info_label(
+                "No breeding pairs found that carry any of the selected traits.\n"
+                "Try selecting different traits or checking that carriers exist."
+            ))
+            layout.addStretch()
+            return
+
+        # Check if any pair covers all traits
+        best_score = scored_pairs[0][0]
+        full_coverage = [p for p in scored_pairs if not p[4]]  # no uncovered traits
+
+        if full_coverage:
+            layout.addWidget(self._info_label(
+                f"{len(full_coverage)} pair(s) can cover ALL selected traits."
+            ))
+        else:
+            best_covered = len(scored_pairs[0][3])
+            layout.addWidget(self._info_label(
+                f"No single pair covers all {len(traits)} traits.\n"
+                f"Best coverage: {best_covered}/{len(traits)} traits."
+            ))
+
+        # Show top pairs (limit to 20)
+        layout.addWidget(self._sec_label("Best Breeding Pairs"))
+        show_pairs = scored_pairs[:20]
+
+        pair_table = QTableWidget(len(show_pairs), 6)
+        pair_table.setHorizontalHeaderLabels([
+            "Parent A", "Parent B", "Score", "Coverage", "Uncovered", "Inbreeding"
+        ])
+        pair_table.verticalHeader().setVisible(False)
+        pair_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        pair_table.setSelectionMode(QAbstractItemView.NoSelection)
+        pair_table.setMaximumHeight(min(30 + len(show_pairs) * 26, 500))
+        pair_table.setStyleSheet(
+            "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
+        )
+        phh = pair_table.horizontalHeader()
+        phh.setSectionResizeMode(0, QHeaderView.Stretch)
+        phh.setSectionResizeMode(1, QHeaderView.Stretch)
+        phh.setSectionResizeMode(2, QHeaderView.Fixed)
+        phh.setSectionResizeMode(3, QHeaderView.Stretch)
+        phh.setSectionResizeMode(4, QHeaderView.Stretch)
+        phh.setSectionResizeMode(5, QHeaderView.Fixed)
+        pair_table.setColumnWidth(2, 55)
+        pair_table.setColumnWidth(5, 70)
+
+        for row, (score, a, b, covered, uncovered, avg_inbred) in enumerate(show_pairs):
+            pair_table.setItem(row, 0, QTableWidgetItem(f"{a.name} ({a.gender_display})"))
+            pair_table.setItem(row, 1, QTableWidgetItem(f"{b.name} ({b.gender_display})"))
+
+            score_item = QTableWidgetItem(f"{score:.0f}/{max_possible}")
+            score_item.setTextAlignment(Qt.AlignCenter)
+            if score >= max_possible:
+                score_item.setForeground(QColor("#8fb8a0"))
+            pair_table.setItem(row, 2, score_item)
+
+            cov_names = ", ".join(t["display"].split("] ")[-1] for t in covered)
+            pair_table.setItem(row, 3, QTableWidgetItem(cov_names))
+
+            if uncovered:
+                unc_names = ", ".join(t["display"].split("] ")[-1] for t in uncovered)
+                unc_item = QTableWidgetItem(unc_names)
+                unc_item.setForeground(QColor("#cc6666"))
+                pair_table.setItem(row, 4, unc_item)
+            else:
+                full_item = QTableWidgetItem("All covered")
+                full_item.setForeground(QColor("#8fb8a0"))
+                pair_table.setItem(row, 4, full_item)
+
+            inbred_item = QTableWidgetItem(f"{avg_inbred:.0%}")
+            inbred_item.setTextAlignment(Qt.AlignCenter)
+            if avg_inbred > 0.2:
+                inbred_item.setForeground(QColor("#cc6666"))
+            pair_table.setItem(row, 5, inbred_item)
+
+        layout.addWidget(pair_table)
+
+        # Per-trait carrier summary
+        layout.addWidget(self._sec_label("Trait Carrier Summary"))
+        for t in traits:
+            carriers = [c for c in alive if _cat_has_trait(c, t["category"], t["key"])]
+            trait_short = t["display"].split("] ")[-1]
+            color = "#8fb8a0" if carriers else "#cc6666"
+            layout.addWidget(self._info_label(
+                f"  {trait_short} (wt {t['weight']}): {len(carriers)} carrier(s)"
+                + (f" -- {', '.join(c.name for c in carriers[:8])}" if carriers else " -- NONE")
+            ))
+
+        layout.addStretch()
+
+    def get_selected_traits(self) -> list[dict]:
+        """Return current selected traits with weights (for export to room optimizer)."""
+        return [dict(t) for t in self._selected_traits]
+
     def _update_trait_plan(self, trait_data: tuple):
-        """Show breeding plan for the selected target trait."""
+        """Show breeding plan for the selected target trait (single-trait mode)."""
         category, trait_key = trait_data
         stim = self._stim_spin.value()
 
@@ -7859,15 +8260,8 @@ class MutationDisorderPlannerView(QWidget):
         for cat in self._cats:
             if cat.status == "Gone":
                 continue
-            if category == "mutation":
-                if any(m.lower() == trait_key for m in (cat.mutations or [])):
-                    carriers.append(cat)
-            elif category == "passive":
-                if any(p.lower() == trait_key for p in (cat.passive_abilities or [])):
-                    carriers.append(cat)
-            elif category == "ability":
-                if any(a.lower() == trait_key for a in (cat.abilities or [])):
-                    carriers.append(cat)
+            if _cat_has_trait(cat, category, trait_key):
+                carriers.append(cat)
 
         # Display name for the trait
         trait_display = self._trait_combo.currentText()
@@ -9056,6 +9450,8 @@ class MainWindow(QMainWindow):
         self._mutation_planner_view = MutationDisorderPlannerView(self)
         self._mutation_planner_view.hide()
         vb.addWidget(self._mutation_planner_view, 1)
+        # Wire planner to optimizer so traits can be imported
+        self._room_optimizer_view.set_planner_view(self._mutation_planner_view)
 
         # Loading overlay — shown during background save parse, dismissed before UI population
         self._loading_overlay = QWidget(w)
