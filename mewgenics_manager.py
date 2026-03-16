@@ -5699,6 +5699,7 @@ class RoomOptimizerWorker(QThread):
                 needs_move = c.status != "In House" or c.room_display != assigned_room_label
                 locator_data.append({
                     "name": c.name, "gender_display": c.gender_display,
+                    "db_key": c.db_key,
                     "age": c.age if c.age is not None else c.db_key,
                     "current_room": current, "assigned_room": assigned_room_label,
                     "room_order": room_idx, "needs_move": needs_move,
@@ -5786,6 +5787,7 @@ class RoomOptimizerCatLocator(QWidget):
     def __init__(self):
         super().__init__()
         self.setStyleSheet("background:#0a0a18;")
+        self._navigate_to_cat_callback = None
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
@@ -5797,9 +5799,14 @@ class RoomOptimizerCatLocator(QWidget):
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(["Cat", "Age", "Currently In", "Move To", "Action"])
         self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setFocusPolicy(Qt.NoFocus)
+        self._table.setMouseTracking(True)
+        self._table.cellClicked.connect(self._on_cat_clicked)
+        self._table.cellEntered.connect(lambda r, c: self._table.setCursor(
+            Qt.PointingHandCursor if c == self.COL_CAT else Qt.ArrowCursor
+        ))
         self._table.setSortingEnabled(True)
         self._table.setAlternatingRowColors(True)
         hh = self._table.horizontalHeader()
@@ -5842,8 +5849,9 @@ class RoomOptimizerCatLocator(QWidget):
         moves_needed = 0
         for row, info in enumerate(all_assignments):
             name_item = QTableWidgetItem(f"{info['name']} ({info['gender_display']})")
-            # Store room_order for sortable "Move To" column
-            name_item.setData(Qt.UserRole, info.get("room_order", 999))
+            name_item.setData(Qt.UserRole, info.get("db_key"))
+            name_item.setForeground(QColor("#5b9bd5"))
+            name_item.setToolTip("Click to jump to this cat in Alive Cats view")
 
             age_val = info.get("age")
             if isinstance(age_val, (int, float)):
@@ -5903,6 +5911,16 @@ class RoomOptimizerCatLocator(QWidget):
         self._summary.setText(
             f"{total} cats  |  {moves_needed} need to move  |  {stay} already in place"
         )
+
+    def _on_cat_clicked(self, row: int, col: int):
+        if col != self.COL_CAT:
+            return
+        item = self._table.item(row, col)
+        if item is None:
+            return
+        db_key = item.data(Qt.UserRole)
+        if db_key is not None and self._navigate_to_cat_callback is not None:
+            self._navigate_to_cat_callback(db_key)
 
     def clear(self):
         self._table.setRowCount(0)
@@ -7232,6 +7250,7 @@ class PerfectCatPlannerView(QWidget):
                     locator_cats[cat.db_key] = {
                         "name": cat.name,
                         "gender_display": cat.gender_display,
+                        "db_key": cat.db_key,
                         "age": cat.age if cat.age is not None else cat.db_key,
                         "current_room": current,
                         "assigned_room": pair_label,
@@ -7249,6 +7268,7 @@ class PerfectCatPlannerView(QWidget):
                     locator_cats[cat.db_key] = {
                         "name": cat.name,
                         "gender_display": cat.gender_display,
+                        "db_key": cat.db_key,
                         "age": cat.age if cat.age is not None else cat.db_key,
                         "current_room": current,
                         "assigned_room": f"Rotation {idx + 1}",
@@ -7724,6 +7744,7 @@ class MutationDisorderPlannerView(QWidget):
         self._cats: list[Cat] = []
         self._selected_pair: list[Cat] = []
         self._selected_traits: list[dict] = []  # [{category, key, display, weight}]
+        self._navigate_to_cat_callback = None
         self._build_ui()
 
     def _build_ui(self):
@@ -8087,15 +8108,28 @@ class MutationDisorderPlannerView(QWidget):
             row_layout.addWidget(wt_label)
 
             spin = QSpinBox()
-            spin.setRange(1, 10)
+            spin.setRange(-10, 10)
             spin.setValue(trait["weight"])
             spin.setFixedWidth(45)
-            spin.setStyleSheet(
-                "QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
-                " border-radius:3px; padding:1px; font-size:10px; }"
-            )
+
+            def _spin_style(v):
+                if v < 0:
+                    return ("QSpinBox { background:#0d0d1c; color:#c86060; border:1px solid #2a2a4a;"
+                            " border-radius:3px; padding:1px; font-size:10px; }")
+                return ("QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+                        " border-radius:3px; padding:1px; font-size:10px; }")
+
+            spin.setStyleSheet(_spin_style(trait["weight"]))
             idx = i  # capture for lambda
-            spin.valueChanged.connect(lambda v, ii=idx: self._on_trait_weight_changed(ii, v))
+            spin.valueChanged.connect(lambda v, ii=idx, s=spin: (
+                self._on_trait_weight_changed(ii, v),
+                s.setStyleSheet(
+                    "QSpinBox { background:#0d0d1c; color:#c86060; border:1px solid #2a2a4a;"
+                    " border-radius:3px; padding:1px; font-size:10px; }" if v < 0
+                    else "QSpinBox { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
+                    " border-radius:3px; padding:1px; font-size:10px; }"
+                )
+            ))
             row_layout.addWidget(spin)
 
             remove_btn = QPushButton("X")
@@ -8148,32 +8182,41 @@ class MutationDisorderPlannerView(QWidget):
             + [(unknown[i], unknown[j]) for i in range(len(unknown)) for j in range(i + 1, len(unknown))]
         )
 
-        max_possible = sum(t["weight"] for t in traits)
-        # With both-parents bonus: max is weight * 1.5 per trait
+        max_possible = sum(t["weight"] for t in traits if t["weight"] > 0)
+        # With both-parents bonus: max is weight * 1.5 per positive trait
         max_score_with_bonus = max_possible * 1.5
 
         scored_pairs: list[tuple] = []
         for a, b in candidate_pairs:
             score = 0.0
-            covered = []
-            uncovered = []
+            covered = []      # positive-weight traits covered by at least one parent
+            uncovered = []    # positive-weight traits not covered
+            penalized = []    # negative-weight traits carried by at least one parent
             for t in traits:
                 a_has = _cat_has_trait(a, t["category"], t["key"])
                 b_has = _cat_has_trait(b, t["category"], t["key"])
-                if a_has or b_has:
-                    score += t["weight"]
-                    if a_has and b_has:
-                        score += t["weight"] * 0.5  # bonus for both carriers
-                    covered.append(t)
+                w = t["weight"]
+                if w < 0:
+                    if a_has or b_has:
+                        score += w  # penalty
+                        if a_has and b_has:
+                            score += w * 0.5  # extra penalty if both carry it
+                        penalized.append(t)
                 else:
-                    uncovered.append(t)
-            if score > 0:
+                    if a_has or b_has:
+                        score += w
+                        if a_has and b_has:
+                            score += w * 0.5  # bonus for both carriers
+                        covered.append(t)
+                    else:
+                        uncovered.append(t)
+            if covered:  # only show pairs that cover at least one positive trait
                 inbred_a = a.inbredness if a.inbredness is not None else 0.0
                 inbred_b = b.inbredness if b.inbredness is not None else 0.0
                 avg_inbred = (inbred_a + inbred_b) / 2.0
-                scored_pairs.append((score, a, b, covered, uncovered, avg_inbred))
+                scored_pairs.append((score, a, b, covered, uncovered, penalized, avg_inbred))
 
-        scored_pairs.sort(key=lambda x: (-x[0], x[5]))  # best score, lowest inbreeding
+        scored_pairs.sort(key=lambda x: (-x[0], x[6]))  # best score, lowest inbreeding
 
         # Build outcome panel
         layout = self._outcome_layout
@@ -8194,19 +8237,20 @@ class MutationDisorderPlannerView(QWidget):
             layout.addStretch()
             return
 
-        # Check if any pair covers all traits
+        # Check if any pair covers all positive traits
+        pos_traits = [t for t in traits if t["weight"] > 0]
         best_score = scored_pairs[0][0]
-        full_coverage = [p for p in scored_pairs if not p[4]]  # no uncovered traits
+        full_coverage = [p for p in scored_pairs if not p[4]]  # no uncovered positive traits
 
         if full_coverage:
             layout.addWidget(self._info_label(
-                f"{len(full_coverage)} pair(s) can cover ALL selected traits."
+                f"{len(full_coverage)} pair(s) can cover ALL positive traits."
             ))
         else:
             best_covered = len(scored_pairs[0][3])
             layout.addWidget(self._info_label(
-                f"No single pair covers all {len(traits)} traits.\n"
-                f"Best coverage: {best_covered}/{len(traits)} traits."
+                f"No single pair covers all {len(pos_traits)} positive traits.\n"
+                f"Best coverage: {best_covered}/{len(pos_traits)} traits."
             ))
 
         # Show top pairs (limit to 20)
@@ -8215,11 +8259,11 @@ class MutationDisorderPlannerView(QWidget):
 
         pair_table = QTableWidget(len(show_pairs), 6)
         pair_table.setHorizontalHeaderLabels([
-            "Parent A", "Parent B", "Score", "Coverage", "Uncovered", "Inbreeding"
+            "Parent A", "Parent B", "Score", "Coverage", "Uncovered / Penalized", "Inbreeding"
         ])
         pair_table.verticalHeader().setVisible(False)
         pair_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        pair_table.setSelectionMode(QAbstractItemView.NoSelection)
+        pair_table.setSelectionMode(QAbstractItemView.SingleSelection)
         pair_table.setMaximumHeight(min(30 + len(show_pairs) * 26, 500))
         pair_table.setStyleSheet(
             "QTableWidget { background:#101023; color:#ddd; border:1px solid #26264a; font-size:11px; }"
@@ -8233,24 +8277,45 @@ class MutationDisorderPlannerView(QWidget):
         phh.setSectionResizeMode(5, QHeaderView.Fixed)
         pair_table.setColumnWidth(2, 55)
         pair_table.setColumnWidth(5, 70)
+        pair_table.cellClicked.connect(self._on_pair_table_clicked)
+        pair_table.setMouseTracking(True)
+        pair_table.cellEntered.connect(lambda r, c: pair_table.setCursor(
+            Qt.PointingHandCursor if c in (0, 1) else Qt.ArrowCursor
+        ))
 
-        for row, (score, a, b, covered, uncovered, avg_inbred) in enumerate(show_pairs):
-            pair_table.setItem(row, 0, QTableWidgetItem(f"{a.name} ({a.gender_display})"))
-            pair_table.setItem(row, 1, QTableWidgetItem(f"{b.name} ({b.gender_display})"))
+        for row, (score, a, b, covered, uncovered, penalized, avg_inbred) in enumerate(show_pairs):
+            a_item = QTableWidgetItem(f"{a.name} ({a.gender_display})")
+            a_item.setData(Qt.UserRole, a.db_key)
+            a_item.setForeground(QColor("#5b9bd5"))
+            a_item.setToolTip("Click to jump to this cat in Alive Cats view")
+            pair_table.setItem(row, 0, a_item)
+
+            b_item = QTableWidgetItem(f"{b.name} ({b.gender_display})")
+            b_item.setData(Qt.UserRole, b.db_key)
+            b_item.setForeground(QColor("#5b9bd5"))
+            b_item.setToolTip("Click to jump to this cat in Alive Cats view")
+            pair_table.setItem(row, 1, b_item)
 
             score_item = QTableWidgetItem(f"{score:.0f}/{max_possible}")
             score_item.setTextAlignment(Qt.AlignCenter)
             if score >= max_possible:
                 score_item.setForeground(QColor("#8fb8a0"))
+            elif score < 0:
+                score_item.setForeground(QColor("#cc6666"))
             pair_table.setItem(row, 2, score_item)
 
             cov_names = ", ".join(t["display"].split("] ")[-1] for t in covered)
             pair_table.setItem(row, 3, QTableWidgetItem(cov_names))
 
+            # Build uncovered + penalized cell
+            parts = []
             if uncovered:
-                unc_names = ", ".join(t["display"].split("] ")[-1] for t in uncovered)
-                unc_item = QTableWidgetItem(unc_names)
-                unc_item.setForeground(QColor("#cc6666"))
+                parts.append(", ".join(t["display"].split("] ")[-1] for t in uncovered))
+            if penalized:
+                parts.append("\u26a0 " + ", ".join(t["display"].split("] ")[-1] for t in penalized))
+            if parts:
+                unc_item = QTableWidgetItem(" | ".join(parts))
+                unc_item.setForeground(QColor("#cc8833") if penalized else QColor("#cc6666"))
                 pair_table.setItem(row, 4, unc_item)
             else:
                 full_item = QTableWidgetItem("All covered")
@@ -8270,13 +8335,33 @@ class MutationDisorderPlannerView(QWidget):
         for t in traits:
             carriers = [c for c in alive if _cat_has_trait(c, t["category"], t["key"])]
             trait_short = t["display"].split("] ")[-1]
-            color = "#8fb8a0" if carriers else "#cc6666"
-            layout.addWidget(self._info_label(
-                f"  {trait_short} (wt {t['weight']}): {len(carriers)} carrier(s)"
+            w = t["weight"]
+            if w < 0:
+                prefix = "\u26a0 "
+                color = "#cc8833" if carriers else "#888"
+            else:
+                prefix = ""
+                color = "#8fb8a0" if carriers else "#cc6666"
+            lbl = self._info_label(
+                f"  {prefix}{trait_short} (wt {w}): {len(carriers)} carrier(s)"
                 + (f" -- {', '.join(c.name for c in carriers[:8])}" if carriers else " -- NONE")
-            ))
+            )
+            lbl.setStyleSheet(f"color:{color}; font-size:11px;")
+            layout.addWidget(lbl)
 
         layout.addStretch()
+
+    def _on_pair_table_clicked(self, row: int, col: int):
+        """Navigate to a cat in the Alive Cats view when its name is clicked."""
+        if col not in (0, 1):
+            return
+        table = self.sender()
+        item = table.item(row, col)
+        if item is None:
+            return
+        db_key = item.data(Qt.UserRole)
+        if db_key is not None and self._navigate_to_cat_callback is not None:
+            self._navigate_to_cat_callback(db_key)
 
     def get_selected_traits(self) -> list[dict]:
         """Return current selected traits with weights (for export to room optimizer)."""
@@ -8479,7 +8564,7 @@ class MutationDisorderPlannerView(QWidget):
             gender_item.setTextAlignment(Qt.AlignCenter)
             self._cat_table.setItem(row, 1, gender_item)
 
-            age_item = QTableWidgetItem(str(cat.age) if cat.age is not None else "—")
+            age_item = _SortByUserRoleItem(str(cat.age) if cat.age is not None else "—")
             age_item.setData(Qt.UserRole, cat.age if cat.age is not None else -1)
             age_item.setTextAlignment(Qt.AlignCenter)
             self._cat_table.setItem(row, 2, age_item)
@@ -9420,7 +9505,6 @@ class MainWindow(QMainWindow):
         # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_AGE, QHeaderView.Fixed)
         self._table.setColumnWidth(COL_AGE, self._base_col_widths[COL_AGE])
-        self._table.setColumnHidden(COL_AGE, True)
 
         # Source: Stretch — absorbs blank space, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_SRC, QHeaderView.Stretch)
@@ -9485,6 +9569,10 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._mutation_planner_view, 1)
         # Wire planner to optimizer so traits can be imported
         self._room_optimizer_view.set_planner_view(self._mutation_planner_view)
+        # Allow cat locator tables to navigate to cat in Alive Cats view
+        self._mutation_planner_view._navigate_to_cat_callback = self._navigate_to_cat
+        self._room_optimizer_view._cat_locator._navigate_to_cat_callback = self._navigate_to_cat
+        self._perfect_planner_view._cat_locator._navigate_to_cat_callback = self._navigate_to_cat
 
         # Loading overlay — shown during background save parse, dismissed before UI population
         self._loading_overlay = QWidget(w)
@@ -10117,6 +10205,26 @@ class MainWindow(QMainWindow):
             self._btn_calibration.setChecked(False)
         if hasattr(self, "_btn_mutation_planner"):
             self._btn_mutation_planner.setChecked(True)
+
+    def _navigate_to_cat(self, db_key: int):
+        """Switch to Alive Cats view and select the given cat by db_key."""
+        self._filter(None, self._btn_all)
+        for row in range(self._proxy_model.rowCount()):
+            src_idx = self._proxy_model.mapToSource(self._proxy_model.index(row, 0))
+            cat = self._source_model.cat_at(src_idx.row())
+            if cat is not None and cat.db_key == db_key:
+                self._table.scrollTo(self._proxy_model.index(row, 0))
+                self._table.selectRow(row)
+                return
+        # Not found in Alive filter — try All Cats
+        self._filter("__all__", self._btn_everyone)
+        for row in range(self._proxy_model.rowCount()):
+            src_idx = self._proxy_model.mapToSource(self._proxy_model.index(row, 0))
+            cat = self._source_model.cat_at(src_idx.row())
+            if cat is not None and cat.db_key == db_key:
+                self._table.scrollTo(self._proxy_model.index(row, 0))
+                self._table.selectRow(row)
+                return
 
     def _update_header(self, room_key):
         if room_key == "__all__":
