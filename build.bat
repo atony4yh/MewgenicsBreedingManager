@@ -35,6 +35,16 @@ echo.
 if exist "%APP_EXE_OUT%" (
     echo Build succeeded!
     echo Executable: %APP_EXE_OUT%
+    echo.
+    echo Waiting for file lock to release...
+    timeout /t 3 /nobreak >nul
+    echo Zipping executable...
+    powershell -NoProfile -Command "Compress-Archive -Path '%APP_EXE_OUT%' -DestinationPath '%DIST_ROOT%\MewgenicsManager.zip' -Force"
+    if exist "%DIST_ROOT%\MewgenicsManager.zip" (
+        echo Zip created: %DIST_ROOT%\MewgenicsManager.zip
+    ) else (
+        echo Warning: zip creation failed.
+    )
 ) else (
     echo Build FAILED - check output above.
 )

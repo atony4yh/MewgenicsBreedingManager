@@ -1454,8 +1454,8 @@ class Cat:
         self.aggression = _read_personality(64)
 
         # Parsed baseline values (before any manual calibration overrides).
+        # NOTE: parsed_age is set after age extraction below.
         self.parsed_gender = self.gender
-        self.parsed_age = self.age
         self.parsed_aggression = self.aggression
         self.parsed_libido = self.libido
         self.parsed_inbredness = self.inbredness
@@ -1590,6 +1590,9 @@ class Cat:
                             break
             except Exception:
                 pass
+
+        self.parsed_age = self.age
+        self.sexuality: Optional[str] = None  # bi / gay / straight — set via calibration
 
         # Legacy token fallback is already handled above when sex_code is unavailable.
 
@@ -1931,12 +1934,33 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
         return False, "Cannot pair a cat with itself"
     ga = (a.gender or "?").strip().lower()
     gb = (b.gender or "?").strip().lower()
+
+    # Sexuality check — gay cats only pair with same gender, straight with opposite, bi with either.
+    sa = getattr(a, "sexuality", None) or ""
+    sb = getattr(b, "sexuality", None) or ""
+    if ga != "?" and gb != "?":
+        same_gender = ga == gb
+        if sa == "gay" and not same_gender:
+            return False, f"{a.name} is gay — needs same-gender partner"
+        if sb == "gay" and not same_gender:
+            return False, f"{b.name} is gay — needs same-gender partner"
+        if sa == "straight" and same_gender:
+            return False, f"{a.name} is straight — needs opposite-gender partner"
+        if sb == "straight" and same_gender:
+            return False, f"{b.name} is straight — needs opposite-gender partner"
+
     # Spidercat/unknown cats ('?') are allowed to pair with any gender.
     if ga == "?" or gb == "?":
         return True, ""
+    # Bi cats can pair with any known gender.
+    if sa == "bi" or sb == "bi":
+        return True, ""
+    # Gay cats confirmed same gender above — allow.
+    if sa == "gay" or sb == "gay":
+        return True, ""
     if ga != gb and {ga, gb} == {"male", "female"}:
         return True, ""
-    # Same known sex
+    # Same known sex (no sexuality override)
     if ga == "female" and gb == "female":
         return False, "Both cats are female — cannot produce offspring"
     if ga == "male" and gb == "male":
@@ -2733,6 +2757,11 @@ def _apply_calibration_data(data: dict, cats: list[Cat]) -> tuple[int, int, int]
                 setattr(cat, field, val)
                 touched = True
 
+        sex = ov.get("sexuality", "")
+        if sex in ("bi", "gay", "straight"):
+            cat.sexuality = sex
+            touched = True
+
         # Apply base stats overrides
         base_stats_override = ov.get("base_stats")
         if isinstance(base_stats_override, dict):
@@ -2809,7 +2838,7 @@ def _load_must_breed(save_path: str, cats: list[Cat]):
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "Age", "♀/♂", "Room", "Status", "BL", "MB"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Relations", "Risk%", "Gen", "Agg", "Lib", "Inbred", "Source"]
+COLUMNS   = ["Name", "Age", "♀/♂", "Room", "Status", "BL", "MB"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Relations", "Risk%", "Agg", "Lib", "Inbred", "Sexuality", "Gen", "Source"]
 COL_NAME  = 0
 COL_AGE   = 1
 COL_GEN   = 2
@@ -2823,11 +2852,12 @@ COL_ABIL  = 15
 COL_MUTS  = 16
 COL_RELNS = 17
 COL_REL   = 18
-COL_GEN_DEPTH = 19   # generation depth
-COL_AGG   = 20
-COL_LIB   = 21
-COL_INBRD = 22
-COL_SRC   = 23
+COL_AGG   = 19
+COL_LIB   = 20
+COL_INBRD = 21
+COL_SEXUALITY = 22
+COL_GEN_DEPTH = 23
+COL_SRC   = 24
 
 # Fixed pixel widths for narrow columns
 _W_STATUS = 62
@@ -3039,6 +3069,8 @@ class CatTableModel(QAbstractTableModel):
             if col == COL_INBRD:
                 label = _trait_label_from_value("inbredness", cat.inbredness)
                 return label if label else "—"
+            if col == COL_SEXUALITY:
+                return getattr(cat, "sexuality", None) or ""
             if col == COL_SRC:
                 pa, pb = cat.parent_a, cat.parent_b
                 if pa is None and pb is None:
@@ -3065,6 +3097,8 @@ class CatTableModel(QAbstractTableModel):
                 return cat.libido if cat.libido is not None else -1.0
             if col == COL_INBRD:
                 return cat.inbredness if cat.inbredness is not None else -1.0
+            if col == COL_SEXUALITY:
+                return getattr(cat, "sexuality", None) or ""
             return self.data(index, Qt.DisplayRole)
 
         elif role == Qt.BackgroundRole:
@@ -3185,7 +3219,7 @@ class CatTableModel(QAbstractTableModel):
                 return Qt.Checked if cat.must_breed else Qt.Unchecked
 
         elif role == Qt.TextAlignmentRole:
-            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_AGE, COL_BL, COL_MB, COL_SUM, COL_REL, COL_GEN_DEPTH, COL_AGG, COL_LIB, COL_INBRD):
+            if col in STAT_COLS or col in (COL_GEN, COL_STAT, COL_AGE, COL_BL, COL_MB, COL_SUM, COL_REL, COL_GEN_DEPTH, COL_AGG, COL_LIB, COL_INBRD, COL_SEXUALITY):
                 return Qt.AlignCenter
 
         return None
@@ -6790,15 +6824,11 @@ class PerfectCatPlannerView(QWidget):
             }
 
         candidate_pairs: list[tuple[Cat, Cat]] = []
-        males = [c for c in alive_cats if c.gender == "male"]
-        females = [c for c in alive_cats if c.gender == "female"]
-        unknown = [c for c in alive_cats if c.gender == "?"]
-        candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in females)
-        candidate_pairs.extend((cat_a, cat_b) for cat_a in males for cat_b in unknown)
-        candidate_pairs.extend((cat_a, cat_b) for cat_a in females for cat_b in unknown)
-        for i, cat_a in enumerate(unknown):
-            for cat_b in unknown[i + 1:]:
-                candidate_pairs.append((cat_a, cat_b))
+        for i, cat_a in enumerate(alive_cats):
+            for cat_b in alive_cats[i + 1:]:
+                ok, _ = can_breed(cat_a, cat_b)
+                if ok:
+                    candidate_pairs.append((cat_a, cat_b))
 
         evaluated_pairs = []
         for cat_a, cat_b in candidate_pairs:
@@ -7309,21 +7339,22 @@ class CalibrationView(QWidget):
     COL_TOKEN_FIELDS = 3
     COL_PARSED_G = 4
     COL_OVR_G = 5
-    COL_PARSED_AGE = 6
-    COL_OVR_AGE = 7
-    COL_PARSED_AGG = 8
-    COL_OVR_AGG = 9
-    COL_PARSED_LIB = 10
-    COL_OVR_LIB = 11
-    COL_PARSED_INB = 12
-    COL_OVR_INB = 13
-    COL_OVR_STR = 14
-    COL_OVR_DEX = 15
-    COL_OVR_CON = 16
-    COL_OVR_INT = 17
-    COL_OVR_SPD = 18
-    COL_OVR_CHA = 19
-    COL_OVR_LCK = 20
+    COL_OVR_SEXUALITY = 6
+    COL_PARSED_AGE = 7
+    COL_OVR_AGE = 8
+    COL_PARSED_AGG = 9
+    COL_OVR_AGG = 10
+    COL_PARSED_LIB = 11
+    COL_OVR_LIB = 12
+    COL_PARSED_INB = 13
+    COL_OVR_INB = 14
+    COL_OVR_STR = 15
+    COL_OVR_DEX = 16
+    COL_OVR_CON = 17
+    COL_OVR_INT = 18
+    COL_OVR_SPD = 19
+    COL_OVR_CHA = 20
+    COL_OVR_LCK = 21
 
     class _AgeNumericDelegate(QStyledItemDelegate):
         def createEditor(self, parent, option, index):
@@ -7395,13 +7426,14 @@ class CalibrationView(QWidget):
         actions.addWidget(self._status)
         root.addLayout(actions)
 
-        self._table = QTableWidget(0, 21)
+        self._table = QTableWidget(0, 22)
         self._table.setHorizontalHeaderLabels([
-            "Name", "Status", "Gender Token", "Pre-G U32s", "Parsed G", "Override G",
-            "Parsed Age", "Override Age",
-            "Parsed Agg", "Override Agg",
-            "Parsed Libido", "Override Libido",
-            "Parsed Inbr", "Override Inbr",
+            "Name", "Status", "Gender\nToken", "Pre-G\nU32s", "Parsed\nG", "Override\nG",
+            "Sexuality",
+            "Parsed\nAge", "Override\nAge",
+            "Parsed\nAgg", "Override\nAgg",
+            "Parsed\nLibido", "Override\nLibido",
+            "Parsed\nInbr", "Override\nInbr",
             "STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK",
         ])
         self._table.verticalHeader().setVisible(False)
@@ -7417,13 +7449,18 @@ class CalibrationView(QWidget):
                          self.COL_OVR_INT, self.COL_OVR_SPD, self.COL_OVR_CHA, self.COL_OVR_LCK):
             self._table.setItemDelegateForColumn(stat_col, self._StatDelegate(self._table))
         hh = self._table.horizontalHeader()
+        hh.setMinimumSectionSize(40)
+        hh.setDefaultAlignment(Qt.AlignCenter)
+        hh.setMinimumHeight(36)
         hh.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_TOKEN, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_TOKEN_FIELDS, QHeaderView.ResizeToContents)
         for col in (self.COL_PARSED_G, self.COL_OVR_G):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
-            self._table.setColumnWidth(col, 84)
+            self._table.setColumnWidth(col, 68)
+        hh.setSectionResizeMode(self.COL_OVR_SEXUALITY, QHeaderView.Fixed)
+        self._table.setColumnWidth(self.COL_OVR_SEXUALITY, 80)
         for col in (
             self.COL_PARSED_AGE, self.COL_OVR_AGE,
             self.COL_PARSED_AGG, self.COL_OVR_AGG,
@@ -7431,9 +7468,9 @@ class CalibrationView(QWidget):
             self.COL_PARSED_INB, self.COL_OVR_INB,
         ):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
-            self._table.setColumnWidth(col, 94)
+            self._table.setColumnWidth(col, 76)
         for col in (self.COL_OVR_AGG, self.COL_OVR_LIB, self.COL_OVR_INB):
-            self._table.setColumnWidth(col, 120)
+            self._table.setColumnWidth(col, 110)
         for stat_col in (self.COL_OVR_STR, self.COL_OVR_DEX, self.COL_OVR_CON,
                          self.COL_OVR_INT, self.COL_OVR_SPD, self.COL_OVR_CHA, self.COL_OVR_LCK):
             hh.setSectionResizeMode(stat_col, QHeaderView.Fixed)
@@ -7489,6 +7526,14 @@ class CalibrationView(QWidget):
         return combo
 
     @staticmethod
+    def _sexuality_combo(value: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(["", "bi", "gay", "straight"])
+        idx = combo.findText((value or "").strip().lower(), Qt.MatchFixedString)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        return combo
+
+    @staticmethod
     def _trait_combo(options: tuple[str, ...], value: str) -> QComboBox:
         combo = QComboBox()
         combo.addItems([""] + list(options))
@@ -7528,6 +7573,7 @@ class CalibrationView(QWidget):
             self._table.setItem(row, self.COL_TOKEN_FIELDS, self._readonly_item(self._fmt_gender_token_fields(cat)))
             self._table.setItem(row, self.COL_PARSED_G, self._readonly_item((getattr(cat, "parsed_gender", cat.gender) or "?")))
             self._table.setCellWidget(row, self.COL_OVR_G, self._gender_combo(str(ov.get("gender", "") or "")))
+            self._table.setCellWidget(row, self.COL_OVR_SEXUALITY, self._sexuality_combo(str(ov.get("sexuality", "") or "")))
 
             self._table.setItem(row, self.COL_PARSED_AGE, self._readonly_item(self._fmt(getattr(cat, "parsed_age", None))))
             self._table.setItem(row, self.COL_OVR_AGE, self._editable_item(self._fmt(ov.get("age"))))
@@ -7581,6 +7627,8 @@ class CalibrationView(QWidget):
             agg = _normalize_trait_override("aggression", self._get_text_item(self._table, row, self.COL_OVR_AGG))
             lib = _normalize_trait_override("libido", self._get_text_item(self._table, row, self.COL_OVR_LIB))
             inb = _normalize_trait_override("inbredness", self._get_text_item(self._table, row, self.COL_OVR_INB))
+            sexuality_raw = self._get_text_item(self._table, row, self.COL_OVR_SEXUALITY).strip().lower()
+            sexuality = sexuality_raw if sexuality_raw in ("bi", "gay", "straight") else ""
 
             # Collect base stats overrides
             base_stats = {}
@@ -7595,7 +7643,7 @@ class CalibrationView(QWidget):
                     except ValueError:
                         pass
 
-            if g or age is not None or agg or lib or inb or base_stats:
+            if g or age is not None or agg or lib or inb or sexuality or base_stats:
                 ov = {"name": cat.name}
                 if g:
                     ov["gender"] = g
@@ -7607,6 +7655,8 @@ class CalibrationView(QWidget):
                     ov["libido"] = lib
                 if inb:
                     ov["inbredness"] = inb
+                if sexuality:
+                    ov["sexuality"] = sexuality
                 if base_stats:
                     ov["base_stats"] = base_stats
                 overrides[uid] = ov
@@ -8170,17 +8220,13 @@ class MutationDisorderPlannerView(QWidget):
         def _cat_score(cat):
             return sum(t["weight"] for t in traits if _cat_has_trait(cat, t["category"], t["key"]))
 
-        # Generate all candidate pairs (opposite gender or unknown)
-        males = [c for c in alive if c.gender and c.gender.lower() == "male"]
-        females = [c for c in alive if c.gender and c.gender.lower() == "female"]
-        unknown = [c for c in alive if c.gender and c.gender.lower() == "?"]
-
-        candidate_pairs = (
-            [(a, b) for a in males for b in females]
-            + [(a, b) for a in males for b in unknown]
-            + [(a, b) for a in females for b in unknown]
-            + [(unknown[i], unknown[j]) for i in range(len(unknown)) for j in range(i + 1, len(unknown))]
-        )
+        # Generate all candidate pairs via can_breed (respects sexuality overrides)
+        candidate_pairs = []
+        for i, a in enumerate(alive):
+            for b in alive[i + 1:]:
+                ok, _ = can_breed(a, b)
+                if ok:
+                    candidate_pairs.append((a, b))
 
         max_possible = sum(t["weight"] for t in traits if t["weight"] > 0)
         # With both-parents bonus: max is weight * 1.5 per positive trait
@@ -8939,6 +8985,7 @@ class MainWindow(QMainWindow):
             COL_AGG: _W_TRAIT,
             COL_LIB: _W_TRAIT,
             COL_INBRD: _W_TRAIT,
+            COL_SEXUALITY: _W_TRAIT,
             **{c: _W_STAT for c in STAT_COLS},
         }
 
@@ -9482,6 +9529,7 @@ class MainWindow(QMainWindow):
             (COL_AGG, _W_TRAIT),
             (COL_LIB, _W_TRAIT),
             (COL_INBRD, _W_TRAIT),
+            (COL_SEXUALITY, _W_TRAIT),
         ] + [(c, _W_STAT) for c in STAT_COLS]:
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
             self._table.setColumnWidth(col, width)
@@ -9505,6 +9553,11 @@ class MainWindow(QMainWindow):
         # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_AGE, QHeaderView.Fixed)
         self._table.setColumnWidth(COL_AGE, self._base_col_widths[COL_AGE])
+
+        # Generation depth: fixed narrow, hidden by default (behind lineage toggle)
+        hh.setSectionResizeMode(COL_GEN_DEPTH, QHeaderView.Fixed)
+        self._table.setColumnWidth(COL_GEN_DEPTH, _W_GEN)
+        self._table.setColumnHidden(COL_GEN_DEPTH, True)
 
         # Source: Stretch — absorbs blank space, hidden by default (behind lineage toggle)
         hh.setSectionResizeMode(COL_SRC, QHeaderView.Stretch)
