@@ -1856,9 +1856,8 @@ def _build_ancestor_contribs_batch(
                 contribs[anc] = contribs.get(anc, 0.0) + new_prob
 
         memo[id(cat)] = contribs
-        # Exclude self from result — COI computation should not count a cat as
-        # its own ancestor (matches the old _ancestor_paths behaviour).  The
-        # memo keeps self so children correctly inherit the parent contribution.
+        # Exclude self from result so COI computation doesn't count a cat as
+        # its own ancestor.  Memo keeps self for correct child propagation.
         result[cat.db_key] = {k: v for k, v in contribs.items() if k is not cat}
 
     return result
@@ -1984,7 +1983,6 @@ class BreedingCache:
     def __init__(self):
         self.ready = False
         # Per-cat data  (keyed by db_key)
-        self.ancestor_paths: dict[int, dict['Cat', list[tuple['Cat', ...]]]] = {}  # legacy, kept for compat
         self.ancestor_contribs: dict[int, dict['Cat', float]] = {}  # {ancestor: sum(0.5^d)}
         self.ancestor_depths: dict[int, dict['Cat', int]] = {}
         # Pairwise data  (keyed by (min_key, max_key))
@@ -2058,18 +2056,6 @@ class BreedingCache:
         if not self.ready:
             return _ancestor_depths(cat, max_depth=max_depth)
         return self.ancestor_depths.get(cat.db_key, {})
-
-    def get_ancestor_paths_for(self, cat: 'Cat') -> dict['Cat', list[tuple['Cat', ...]]]:
-        if not self.ready:
-            return _ancestor_paths(cat)
-        return self.ancestor_paths.get(cat.db_key, {})
-
-    def get_raw_coi_from_keys(self, a_key: int, b_key: int) -> float:
-        ca = self.ancestor_contribs.get(a_key)
-        cb = self.ancestor_contribs.get(b_key)
-        if ca is None or cb is None:
-            return 0.0
-        return _coi_from_contribs(ca, cb)
 
 
 class BreedingCacheWorker(QThread):
