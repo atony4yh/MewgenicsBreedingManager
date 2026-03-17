@@ -1891,9 +1891,21 @@ def _coi_from_contribs(
     return coi * 0.5
 
 
+def _combined_malady_chance(coi: float) -> float:
+    """
+    Probability that AT LEAST ONE birth defect occurs, from game logic.
+    Combines disorder chance (base 2%, scales above 0.20 CoI) with
+    part-defect chance (0 below 0.05 CoI, then 1.5×CoI).
+    """
+    disorder = 0.02 + 0.4 * min(max(coi - 0.20, 0.0), 1.0)
+    defect = min(1.5 * coi, 1.0) if coi > 0.05 else 0.0
+    return 1.0 - (1.0 - disorder) * (1.0 - defect)
+
+
 def risk_percent(a: Optional['Cat'], b: Optional['Cat']) -> float:
-    """Raw CoI as a percentage, clamped to [0, 100]."""
-    return max(0.0, min(100.0, raw_coi(a, b) * 100.0))
+    """Combined birth-defect probability as a percentage, clamped to [0, 100]."""
+    coi = raw_coi(a, b)
+    return max(0.0, min(100.0, _combined_malady_chance(coi) * 100.0))
 
 
 def find_common_ancestors(a: Cat, b: Cat) -> list[Cat]:
@@ -1993,7 +2005,7 @@ class BreedingCache:
 
     # ── disk persistence ──
 
-    _CACHE_VERSION = 3  # bump to invalidate stale disk caches
+    _CACHE_VERSION = 4  # bump to invalidate stale disk caches
 
     def save_to_disk(self, save_path: str):
         """Persist pairwise results alongside the save file."""
@@ -2192,7 +2204,7 @@ class BreedingCacheWorker(QThread):
             pa = paths_batch.get(a.db_key, {})
             pb = paths_batch.get(b.db_key, {})
             raw = _raw_coi_from_paths(pa, pb)
-            cache.risk_pct[pk] = max(0.0, min(100.0, raw * 100.0))
+            cache.risk_pct[pk] = max(0.0, min(100.0, _combined_malady_chance(raw) * 100.0))
 
             da = cache.ancestor_depths.get(a.db_key, {})
             db_depths = cache.ancestor_depths.get(b.db_key, {})
@@ -4779,7 +4791,7 @@ class SafeBreedingView(QWidget):
 
         self._summary.setText(
             f"{len(candidates)} possible alive candidates  |  "
-            "Risk% = inbreeding coefficient (birth defects scale above 20%)"
+            "Risk% = combined birth-defect probability from game CoI formula"
         )
         self._table.setRowCount(len(candidates))
         for row, (rel, packed_shared, closest_recent_gen, other) in enumerate(candidates):
