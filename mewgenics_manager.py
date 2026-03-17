@@ -1342,6 +1342,121 @@ def _inheritance_candidates(
     return chips, share_a, share_b
 
 
+def _trait_inheritance_probabilities(
+    a: 'Cat', b: 'Cat', stimulation: float,
+) -> list[tuple[str, str, float, str]]:
+    """
+    Calculate per-trait inheritance probabilities using game formulas.
+    Returns list of (display_name, category, probability, source_detail).
+
+    Game formulas (from PurpleMyst's research):
+    - Abilities: base_chance = 0.2 + 0.025 * stim, then diluted by pool size
+    - Passives: base_chance = 0.05 + 0.01 * stim, then diluted by pool size
+    - SkillShare+ parent: 100% for passives from that parent
+    - Mutations: 80% base inheritance, favored by stimulation
+    """
+    stim = max(0.0, min(100.0, float(stimulation)))
+    favor_weight = _stimulation_inheritance_weight(stim)
+    results: list[tuple[str, str, float, str]] = []
+
+    a_has_skillshare = any(p.lower() in ("skillshare", "skillshare+", "skillshareplus")
+                          for p in (a.passive_abilities or []))
+    b_has_skillshare = any(p.lower() in ("skillshare", "skillshare+", "skillshareplus")
+                          for p in (b.passive_abilities or []))
+
+    # ── Active abilities ──
+    ability_base = 0.2 + 0.025 * stim
+    a_abilities = list(a.abilities or [])
+    b_abilities = list(b.abilities or [])
+    seen: dict[str, tuple[float, str]] = {}
+    b_keys = {x.lower() for x in b_abilities}
+    a_keys = {x.lower() for x in a_abilities}
+
+    for ab in a_abilities:
+        key = ab.lower()
+        prob_a = ability_base * favor_weight / len(a_abilities)
+        if key in b_keys:
+            prob_b = ability_base * (1.0 - favor_weight) / len(b_abilities)
+            prob = min(1.0, prob_a + prob_b)
+            seen[key] = (prob, f"Both parents ({prob*100:.0f}%)")
+        else:
+            seen[key] = (prob_a, f"From {a.name} ({prob_a*100:.0f}%)")
+
+    for ab in b_abilities:
+        key = ab.lower()
+        if key not in seen:
+            prob_b = ability_base * (1.0 - favor_weight) / len(b_abilities)
+            seen[key] = (prob_b, f"From {b.name} ({prob_b*100:.0f}%)")
+
+    for key, (prob, detail) in seen.items():
+        display = key
+        for ab in a_abilities + b_abilities:
+            if ab.lower() == key:
+                display = ab
+                break
+        results.append((display, "ability", prob, detail))
+
+    # ── Passive abilities ──
+    passive_base = 0.05 + 0.01 * stim
+    a_passives = list(a.passive_abilities or [])
+    b_passives = list(b.passive_abilities or [])
+    seen_p: dict[str, tuple[float, str]] = {}
+    b_pkeys = {x.lower() for x in b_passives}
+
+    for pa in a_passives:
+        key = pa.lower()
+        if a_has_skillshare:
+            prob = 1.0
+            seen_p[key] = (prob, f"SkillShare+ from {a.name} (100%)")
+        else:
+            prob_a = passive_base * favor_weight / len(a_passives)
+            if key in b_pkeys:
+                prob_b = 1.0 if b_has_skillshare else passive_base * (1.0 - favor_weight) / len(b_passives)
+                prob = min(1.0, prob_a + prob_b)
+                seen_p[key] = (prob, f"Both parents ({prob*100:.0f}%)")
+            else:
+                seen_p[key] = (prob_a, f"From {a.name} ({prob_a*100:.0f}%)")
+
+    for pa in b_passives:
+        key = pa.lower()
+        if key not in seen_p:
+            if b_has_skillshare:
+                seen_p[key] = (1.0, f"SkillShare+ from {b.name} (100%)")
+            else:
+                prob_b = passive_base * (1.0 - favor_weight) / len(b_passives)
+                seen_p[key] = (prob_b, f"From {b.name} ({prob_b*100:.0f}%)")
+
+    for key, (prob, detail) in seen_p.items():
+        results.append((_mutation_display_name(key), "passive", prob, detail))
+
+    # ── Mutations (visual) ──
+    mutation_base = 0.80
+    a_mutations = list(a.mutations or [])
+    b_mutations = list(b.mutations or [])
+    seen_m: dict[str, tuple[float, str]] = {}
+    b_mkeys = {x.lower() for x in b_mutations}
+
+    for mut in a_mutations:
+        key = mut.lower()
+        if key in b_mkeys:
+            seen_m[key] = (mutation_base, f"Both parents ({mutation_base*100:.0f}%)")
+        else:
+            prob = mutation_base * favor_weight
+            seen_m[key] = (prob, f"From {a.name} ({prob*100:.0f}%)")
+
+    for mut in b_mutations:
+        key = mut.lower()
+        if key not in seen_m:
+            prob = mutation_base * (1.0 - favor_weight)
+            seen_m[key] = (prob, f"From {b.name} ({prob*100:.0f}%)")
+
+    for key, (prob, detail) in seen_m.items():
+        results.append((_mutation_display_name(key), "mutation", prob, detail))
+
+    results.sort(key=lambda x: (-x[2], x[0].lower()))
+    return results
+
+
 # ── Cat ───────────────────────────────────────────────────────────────────────
 
 class Cat:
@@ -1938,15 +2053,26 @@ def kinship_coi(a: Optional['Cat'], b: Optional['Cat'],
     return _kinship(a, b, memo)
 
 
+def _malady_breakdown(coi: float) -> tuple[float, float, float]:
+    """
+    Return (disorder_chance, part_defect_chance, combined_chance) from game logic.
+    - Disorder: base 2%, scales above 0.20 CoI — chance of birth defect disorder
+    - Part defect: 0 below 0.05 CoI, then 1.5×CoI — chance of mutated part defects
+    - Combined: union probability of at least one occurring
+    """
+    disorder = 0.02 + 0.4 * min(max(coi - 0.20, 0.0), 1.0)
+    defect = min(1.5 * coi, 1.0) if coi > 0.05 else 0.0
+    combined = 1.0 - (1.0 - disorder) * (1.0 - defect)
+    return disorder, defect, combined
+
+
 def _combined_malady_chance(coi: float) -> float:
     """
     Probability that AT LEAST ONE birth defect occurs, from game logic.
     Combines disorder chance (base 2%, scales above 0.20 CoI) with
     part-defect chance (0 below 0.05 CoI, then 1.5×CoI).
     """
-    disorder = 0.02 + 0.4 * min(max(coi - 0.20, 0.0), 1.0)
-    defect = min(1.5 * coi, 1.0) if coi > 0.05 else 0.0
-    return 1.0 - (1.0 - disorder) * (1.0 - defect)
+    return _malady_breakdown(coi)[2]
 
 
 def risk_percent(a: Optional['Cat'], b: Optional['Cat'],
@@ -4045,6 +4171,53 @@ class CatDetailPanel(QWidget):
         else:
             inh.addWidget(QLabel("No passive candidates.", styleSheet=_META_STYLE))
 
+        # ── Trait inheritance probabilities ──
+        trait_probs = _trait_inheritance_probabilities(a, b, stim)
+        if trait_probs:
+            inh.addWidget(QLabel("Trait inheritance chances", styleSheet="color:#555; font-size:10px;"))
+            prob_chips: list[tuple[str, str]] = []
+            for display, category, prob, detail in trait_probs:
+                pct = prob * 100
+                cat_label = {"ability": "Spell", "passive": "Passive", "mutation": "Mutation"}.get(category, category)
+                chip_text = f"{display} {pct:.0f}%"
+                tip_text = f"[{cat_label}] {detail}\n{_ability_tip(display)}" if _ability_tip(display) else f"[{cat_label}] {detail}"
+                prob_chips.append((chip_text, tip_text))
+            inh.addWidget(_wrapped_chip_block(prob_chips, max_per_row=5))
+
+        # ── Risk breakdown ──
+        coi = kinship_coi(a, b)
+        disorder_ch, part_defect_ch, combined_ch = _malady_breakdown(coi)
+        risk_row = QHBoxLayout()
+        risk_row.setSpacing(8)
+        risk_row.addWidget(QLabel("Risk:", styleSheet="color:#555; font-size:10px;"))
+
+        def _risk_chip(text: str, value: float) -> QLabel:
+            c = _chip(text)
+            if value > 0.10:
+                bg = "#6a2a2a"
+            elif value > 0.03:
+                bg = "#5a4a2a"
+            else:
+                bg = "#2a3a2a"
+            c.setStyleSheet(
+                f"QLabel {{ background:{bg}; color:#ddd; border-radius:6px;"
+                f" padding:2px 7px; font-size:11px; }}")
+            return c
+
+        risk_row.addWidget(_risk_chip(f"Disorder {disorder_ch*100:.1f}%", disorder_ch))
+        risk_row.addWidget(_risk_chip(f"Part defect {part_defect_ch*100:.1f}%", part_defect_ch))
+        risk_row.addWidget(_risk_chip(f"Combined {combined_ch*100:.1f}%", combined_ch))
+        disorder_tip = QLabel("(?)")
+        disorder_tip.setStyleSheet("color:#555; font-size:10px;")
+        disorder_tip.setToolTip(
+            "Disorder: base 2%, scales above 0.20 CoI\n"
+            "Part defect: 0 below 0.05 CoI, then 1.5x CoI\n"
+            "Combined: chance of at least one occurring"
+        )
+        risk_row.addWidget(disorder_tip)
+        risk_row.addStretch()
+        inh.addLayout(risk_row)
+
         root.addLayout(inh)
 
         # ── Breakpoints + appearance + lineage ─────────────────────────────
@@ -5229,6 +5402,7 @@ class RoomOptimizerView(QWidget):
 
         # Tab 1: Breeding Pairs (existing detail panel)
         self._details_pane = RoomOptimizerDetailPanel()
+        self._details_pane._navigate_to_cat_callback = self._navigate_to_cat_from_breeding_pairs
         self._bottom_tabs.addTab(self._details_pane, "Breeding Pairs")
 
         # Tab 2: Cat Locator
@@ -5278,6 +5452,19 @@ class RoomOptimizerView(QWidget):
             self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
         else:
             self._summary.setText(f"{alive_count} alive cats available")
+
+    def _navigate_to_cat_from_breeding_pairs(self, cat_name_formatted: str):
+        """Navigate to a cat by its formatted name (e.g. 'Fluffy (Female)')."""
+        # Extract the cat name part (before the gender)
+        cat_name = cat_name_formatted.split(" (")[0] if " (" in cat_name_formatted else cat_name_formatted
+
+        # Find the cat by name
+        for cat in self._cats:
+            if cat.name == cat_name:
+                # Call the cat locator's callback if available
+                if self._cat_locator._navigate_to_cat_callback:
+                    self._cat_locator._navigate_to_cat_callback(cat.db_key)
+                return
 
     def set_cache(self, cache: Optional['BreedingCache']):
         self._cache = cache
@@ -6013,14 +6200,36 @@ class RoomOptimizerDetailPanel(QWidget):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(8)
 
+        # Header with summary label and best pairs toggle
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
         self._summary = QLabel("Select a room to see pair details.")
         self._summary.setStyleSheet("color:#aaa; font-size:12px;")
         self._summary.setWordWrap(True)
-        root.addWidget(self._summary)
+        hdr.addWidget(self._summary, 1)
 
-        self._pairs_table = QTableWidget(0, 12)
+        self._best_pairs_btn = QPushButton("All Pairs")
+        self._best_pairs_btn.setCheckable(True)
+        self._best_pairs_btn.setChecked(False)
+        self._best_pairs_btn.setFixedWidth(90)
+        self._best_pairs_btn.setStyleSheet(
+            "QPushButton { background:#1e1e38; color:#ccc; border:1px solid #2a2a4a; padding:4px;"
+            "             font-size:11px; border-radius:3px; }"
+            "QPushButton:hover { background:#252555; }"
+            "QPushButton:checked { background:#3a5a7a; color:#fff; }"
+        )
+        self._best_pairs_btn.setToolTip("Best Pairs: one unique match per cat\nAll Pairs: every valid combination")
+        self._best_pairs_btn.clicked.connect(self._on_toggle_best_pairs)
+        hdr.addWidget(self._best_pairs_btn)
+
+        root.addLayout(hdr)
+
+        self._current_data: Optional[dict] = None
+        self._navigate_to_cat_callback = None  # Callback to navigate to a cat by name
+
+        self._pairs_table = QTableWidget(0, 13)
         self._pairs_table.setHorizontalHeaderLabels([
-            "Pair", "STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK", "Sum", "Avg", "Inbred Risk", "Rank"
+            "Cat A", "Cat B", "STR", "DEX", "CON", "INT", "SPD", "CHA", "LCK", "Sum", "Avg", "Inbred Risk", "Rank"
         ])
         self._pairs_table.verticalHeader().setVisible(False)
         self._pairs_table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -6030,15 +6239,17 @@ class RoomOptimizerDetailPanel(QWidget):
         self._pairs_table.setAlternatingRowColors(True)
         hh = self._pairs_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        for col in range(1, 12):
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        for col in range(2, 13):
             hh.setSectionResizeMode(col, QHeaderView.Fixed)
-        self._pairs_table.setColumnWidth(0, 240)
-        for col in range(1, 8):
+        self._pairs_table.setColumnWidth(0, 120)
+        self._pairs_table.setColumnWidth(1, 120)
+        for col in range(2, 9):
             self._pairs_table.setColumnWidth(col, 40)
-        self._pairs_table.setColumnWidth(8, 60)
-        self._pairs_table.setColumnWidth(9, 50)
-        self._pairs_table.setColumnWidth(10, 75)
-        self._pairs_table.setColumnWidth(11, 50)
+        self._pairs_table.setColumnWidth(9, 60)
+        self._pairs_table.setColumnWidth(10, 50)
+        self._pairs_table.setColumnWidth(11, 75)
+        self._pairs_table.setColumnWidth(12, 50)
         self._pairs_table.setStyleSheet("""
             QTableWidget {
                 background:#0d0d1c; alternate-background-color:#131326;
@@ -6051,6 +6262,7 @@ class RoomOptimizerDetailPanel(QWidget):
                 border-right:1px solid #16213e; font-size:11px; font-weight:bold;
             }
         """)
+        self._pairs_table.itemClicked.connect(self._on_pair_cell_clicked)
         root.addWidget(self._pairs_table, 1)
 
         self._excluded_table = QTableWidget(0, 12)
@@ -6086,6 +6298,40 @@ class RoomOptimizerDetailPanel(QWidget):
         """)
         root.addWidget(self._excluded_table, 1)
 
+    def _on_pair_cell_clicked(self, item):
+        """Handle clicks on cat names to navigate to the cat in the main view."""
+        col = self._pairs_table.column(item)
+        # Only handle clicks on Cat A (column 0) or Cat B (column 1)
+        if col not in (0, 1):
+            return
+
+        cat_name = item.text()
+        if not cat_name or not self._navigate_to_cat_callback:
+            return
+
+        # Call the navigate callback with the cat name
+        self._navigate_to_cat_callback(cat_name)
+
+    def _on_toggle_best_pairs(self):
+        """Re-render pairs table based on toggle state."""
+        checked = self._best_pairs_btn.isChecked()
+        self._best_pairs_btn.setText("Best Pairs" if checked else "All Pairs")
+        if self._current_data:
+            self.show_room(self._current_data)
+
+    @staticmethod
+    def _apply_best_pairs_filter(pairs: list[dict]) -> list[dict]:
+        """Greedy non-overlapping pair selection. pairs must be pre-sorted best-first."""
+        used = set()
+        result = []
+        for pair in pairs:
+            a, b = pair["cat_a"], pair["cat_b"]
+            if a not in used and b not in used:
+                result.append(pair)
+                used.add(a)
+                used.add(b)
+        return result
+
     @staticmethod
     def _range_background(lo: int, hi: int) -> QColor:
         base = STAT_COLORS.get(max(lo, hi), QColor(100, 100, 115))
@@ -6109,6 +6355,8 @@ class RoomOptimizerDetailPanel(QWidget):
             self._pairs_table.show()
             self._excluded_table.hide()
             return
+
+        self._current_data = data
 
         room = data.get("room", "Unknown")
         cats = data.get("cats", [])
@@ -6161,14 +6409,29 @@ class RoomOptimizerDetailPanel(QWidget):
         )
         self._summary.setToolTip("Cats: " + ", ".join(cats) if cats else "")
 
+        # Preserve original rank before filtering
+        for i, pair in enumerate(pairs, 1):
+            pair["_original_rank"] = i
+
+        # Apply best pairs filter if enabled
+        if self._best_pairs_btn.isChecked():
+            pairs = self._apply_best_pairs_filter(pairs)
+
         self._pairs_table.setRowCount(len(pairs))
         for i, pair in enumerate(pairs, 1):
-            pair_item = QTableWidgetItem(f"{pair['cat_a']} x {pair['cat_b']}")
-            # Color by room (extract room from pair's assigned_room info if available)
-            for room_key, room_display in ROOM_DISPLAY.items():
-                if room_display == room and room_key in ROOM_COLORS:
-                    pair_item.setForeground(QBrush(ROOM_COLORS[room_key]))
-                    break
+            # Cat A and B items with hyperlink styling
+            cat_a_item = QTableWidgetItem(pair['cat_a'])
+            cat_b_item = QTableWidgetItem(pair['cat_b'])
+            # Style as hyperlinks
+            hyperlink_color = QColor(0x5b9bd5)  # Blue
+            cat_a_item.setForeground(QBrush(hyperlink_color))
+            cat_b_item.setForeground(QBrush(hyperlink_color))
+            font = cat_a_item.font()
+            font.setUnderline(True)
+            cat_a_item.setFont(font)
+            cat_b_item.setFont(font)
+            cat_a_item.setToolTip("Click to jump to this cat in Alive Cats view")
+            cat_b_item.setToolTip("Click to jump to this cat in Alive Cats view")
             sum_lo, sum_hi = pair.get("sum_range", (0, 0))
             sum_item = QTableWidgetItem(f"{sum_lo}-{sum_hi}")
             sum_item.setToolTip(f"Possible offspring stat sum range: {sum_lo} to {sum_hi}")
@@ -6182,7 +6445,7 @@ class RoomOptimizerDetailPanel(QWidget):
                 item.setBackground(QBrush(self._range_background(lo, hi)))
                 stat_items.append(item)
             risk_item = QTableWidgetItem(f"{pair['risk']:.0f}%")
-            rank_item = QTableWidgetItem(str(i))
+            rank_item = QTableWidgetItem(str(pair.get("_original_rank", i)))
 
             for item in stat_items:
                 item.setTextAlignment(Qt.AlignCenter)
@@ -6201,13 +6464,14 @@ class RoomOptimizerDetailPanel(QWidget):
             else:
                 risk_item.setForeground(QBrush(QColor(98, 194, 135)))
 
-            self._pairs_table.setItem(i - 1, 0, pair_item)
-            for j, item in enumerate(stat_items, 1):
+            self._pairs_table.setItem(i - 1, 0, cat_a_item)
+            self._pairs_table.setItem(i - 1, 1, cat_b_item)
+            for j, item in enumerate(stat_items, 2):
                 self._pairs_table.setItem(i - 1, j, item)
-            self._pairs_table.setItem(i - 1, 8, sum_item)
-            self._pairs_table.setItem(i - 1, 9, avg_item)
-            self._pairs_table.setItem(i - 1, 10, risk_item)
-            self._pairs_table.setItem(i - 1, 11, rank_item)
+            self._pairs_table.setItem(i - 1, 9, sum_item)
+            self._pairs_table.setItem(i - 1, 10, avg_item)
+            self._pairs_table.setItem(i - 1, 11, risk_item)
+            self._pairs_table.setItem(i - 1, 12, rank_item)
 
 
 class PerfectPlannerDetailPanel(QWidget):
@@ -7540,6 +7804,7 @@ class CalibrationView(QWidget):
                          self.COL_OVR_INT, self.COL_OVR_SPD, self.COL_OVR_CHA, self.COL_OVR_LCK):
             hh.setSectionResizeMode(stat_col, QHeaderView.Fixed)
             self._table.setColumnWidth(stat_col, 50)
+        self._table.setSortingEnabled(True)
         root.addWidget(self._table, 1)
 
         self._save_btn.clicked.connect(self._save_clicked)
@@ -7626,13 +7891,16 @@ class CalibrationView(QWidget):
         if not isinstance(overrides, dict):
             overrides = {}
 
+        self._table.setSortingEnabled(False)
         self._table.setRowCount(len(self._cats))
         for row, cat in enumerate(self._cats):
             self._row_cat.append(cat)
             uid = (cat.unique_id or "").strip().lower()
             ov = overrides.get(uid) if isinstance(overrides.get(uid), dict) else {}
 
-            self._table.setItem(row, self.COL_NAME, self._readonly_item(cat.name or "?"))
+            name_item = self._readonly_item(cat.name or "?")
+            name_item.setData(Qt.UserRole, cat)
+            self._table.setItem(row, self.COL_NAME, name_item)
             self._table.setItem(row, self.COL_STATUS, self._readonly_item(cat.status))
             self._table.setItem(row, self.COL_TOKEN, self._readonly_item(getattr(cat, "gender_token", "") or ""))
             self._table.setItem(row, self.COL_TOKEN_FIELDS, self._readonly_item(self._fmt_gender_token_fields(cat)))
@@ -7672,6 +7940,7 @@ class CalibrationView(QWidget):
                 item.setToolTip(f"Current: {current_val}")
                 self._table.setItem(row, stat_col, item)
 
+        self._table.setSortingEnabled(True)
         self._status.setText(f"{len(self._cats)} alive cats")
 
     def _reload_clicked(self):
@@ -7683,7 +7952,11 @@ class CalibrationView(QWidget):
 
     def _collect_calibration_data(self) -> dict:
         overrides: dict[str, dict] = {}
-        for row, cat in enumerate(self._row_cat):
+        for row in range(self._table.rowCount()):
+            name_item = self._table.item(row, self.COL_NAME)
+            cat = name_item.data(Qt.UserRole) if name_item else None
+            if cat is None:
+                continue
             uid = (cat.unique_id or "").strip().lower()
             if not uid:
                 continue
@@ -8298,8 +8571,8 @@ class MutationDisorderPlannerView(QWidget):
         stim = self._stim_spin.value()
         traits = self._selected_traits
 
-        # Get all alive cats
-        alive = [c for c in self._cats if c.status != "Gone"]
+        # Get all alive cats, excluding blacklisted
+        alive = [c for c in self._cats if c.status != "Gone" and not c.is_blacklisted]
 
         # Score each cat: how many of the selected traits does it carry?
         def _cat_score(cat):
@@ -8503,10 +8776,10 @@ class MutationDisorderPlannerView(QWidget):
         category, trait_key = trait_data
         stim = self._stim_spin.value()
 
-        # Find all alive cats that have this trait
+        # Find all alive cats that have this trait, excluding blacklisted
         carriers: list[Cat] = []
         for cat in self._cats:
-            if cat.status == "Gone":
+            if cat.status == "Gone" or cat.is_blacklisted:
                 continue
             if _cat_has_trait(cat, category, trait_key):
                 carriers.append(cat)
@@ -8598,7 +8871,7 @@ class MutationDisorderPlannerView(QWidget):
 
         males = [c for c in carriers if c.gender and c.gender.upper() in ("M", "MALE")]
         females = [c for c in carriers if c.gender and c.gender.upper() in ("F", "FEMALE")]
-        non_carriers = [c for c in self._cats if c.status != "Gone" and c not in carriers]
+        non_carriers = [c for c in self._cats if c.status != "Gone" and not c.is_blacklisted and c not in carriers]
         nc_males = [c for c in non_carriers if c.gender and c.gender.upper() in ("M", "MALE")]
         nc_females = [c for c in non_carriers if c.gender and c.gender.upper() in ("F", "FEMALE")]
 
@@ -8832,19 +9105,16 @@ class MutationDisorderPlannerView(QWidget):
         else:
             layout.addWidget(self._info_label("  Neither parent has passives/disorders to pass."))
 
-        # Birth defect risk
-        inbred_a = cat_a.inbredness if cat_a.inbredness is not None else 0.0
-        inbred_b = cat_b.inbredness if cat_b.inbredness is not None else 0.0
-        # Approximate offspring inbreeding from parents
-        avg_inbred = (inbred_a + inbred_b) / 2.0
-        birth_defect_chance = 0.02 + 0.4 * max(0.0, min(avg_inbred - 0.2, 1.0))
-        birth_defect_chance = min(birth_defect_chance, 1.0)
+        # Birth defect risk breakdown
+        coi = kinship_coi(cat_a, cat_b)
+        disorder_ch, part_defect_ch, combined_ch = _malady_breakdown(coi)
         inbred_note = ""
         if cat_a.inbredness is None and cat_b.inbredness is None:
             inbred_note = " (parent inbreeding unknown, assuming 0)"
         layout.addWidget(self._info_label(
-            f"  Birth defect disorder chance: {birth_defect_chance*100:.1f}%{inbred_note}\n"
-            f"  (if offspring inherits < 2 disorders)"
+            f"  Disorder chance: {disorder_ch*100:.1f}%  (base 2%, scales above 0.20 CoI)\n"
+            f"  Part defect chance: {part_defect_ch*100:.1f}%  (0 below 0.05 CoI, then 1.5x CoI)\n"
+            f"  Combined risk: {combined_ch*100:.1f}%{inbred_note}"
         ))
 
         note_lbl = QLabel(
