@@ -1891,6 +1891,49 @@ def _coi_from_contribs(
     return coi * 0.5
 
 
+def _kinship(a: Optional['Cat'], b: Optional['Cat'],
+             memo: dict[tuple[int, int], float]) -> float:
+    """
+    Memoised kinship coefficient between two cats.
+
+    f(a, a) = (1 + F_a) / 2   where F_a = f(a.sire, a.dam)
+    f(a, b) = (f(younger.sire, other) + f(younger.dam, other)) / 2
+
+    Mathematically equivalent to Wright's path-coefficient COI but runs in
+    O(unique ancestor pairs) instead of O(2^depth).
+    """
+    if a is None or b is None:
+        return 0.0
+    ia, ib = id(a), id(b)
+    key = (ia, ib) if ia <= ib else (ib, ia)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached
+    if a is b:
+        result = (1.0 + _kinship(a.parent_a, a.parent_b, memo)) / 2.0
+    else:
+        # Recurse on the younger cat's parents (higher generation number)
+        if a.generation > b.generation:
+            result = (_kinship(a.parent_a, b, memo) + _kinship(a.parent_b, b, memo)) / 2.0
+        else:
+            result = (_kinship(a, b.parent_a, memo) + _kinship(a, b.parent_b, memo)) / 2.0
+    memo[key] = result
+    return result
+
+
+def kinship_coi(a: Optional['Cat'], b: Optional['Cat'],
+                memo: Optional[dict] = None) -> float:
+    """
+    COI of a hypothetical offspring of a × b, using memoised kinship.
+    Pass a shared *memo* dict across multiple calls for O(1) amortised lookups.
+    """
+    if a is None or b is None:
+        return 0.0
+    if memo is None:
+        memo = {}
+    return _kinship(a, b, memo)
+
+
 def _combined_malady_chance(coi: float) -> float:
     """
     Probability that AT LEAST ONE birth defect occurs, from game logic.
@@ -1902,9 +1945,10 @@ def _combined_malady_chance(coi: float) -> float:
     return 1.0 - (1.0 - disorder) * (1.0 - defect)
 
 
-def risk_percent(a: Optional['Cat'], b: Optional['Cat']) -> float:
+def risk_percent(a: Optional['Cat'], b: Optional['Cat'],
+                 memo: Optional[dict] = None) -> float:
     """Combined birth-defect probability as a percentage, clamped to [0, 100]."""
-    coi = raw_coi(a, b)
+    coi = kinship_coi(a, b, memo)
     return max(0.0, min(100.0, _combined_malady_chance(coi) * 100.0))
 
 
@@ -2005,7 +2049,7 @@ class BreedingCache:
 
     # ── disk persistence ──
 
-    _CACHE_VERSION = 4  # bump to invalidate stale disk caches
+    _CACHE_VERSION = 5  # bump to invalidate stale disk caches
 
     def save_to_disk(self, save_path: str):
         """Persist pairwise results alongside the save file."""
@@ -2031,7 +2075,6 @@ class BreedingCache:
             with open(cp, "r") as f:
                 data = json.load(f)
             if data.get("version") != BreedingCache._CACHE_VERSION:
-                print(f"[DEBUG] Disk cache version mismatch: {data.get('version')} != {BreedingCache._CACHE_VERSION}, recomputing")
                 return None  # old format, recompute
             if abs(data.get("save_mtime", 0) - os.path.getmtime(save_path)) > 0.5:
                 return None  # save file changed, cache is stale
@@ -2134,7 +2177,6 @@ class BreedingCacheWorker(QThread):
             prev = None
 
         changed_keys = alive_keys - unchanged_keys
-
         cache = BreedingCache()
         cache._cats_by_key = {c.db_key: c for c in alive}
 
@@ -2174,9 +2216,10 @@ class BreedingCacheWorker(QThread):
 
         # ── Phase 2: pairwise risk + shared (skip same-sex, reuse unchanged) ──
         # Use path-based COI (with overlap exclusion) for correct results in
-        # heavily inbred colonies.  The contribs-based formula overestimates
-        # because it doesn't exclude overlapping paths.
-        paths_batch = _build_ancestor_paths_batch(alive)
+        # heavily inbred colonies.  Kinship is O(ancestor pairs) with memo
+        # shared across all pair computations — orders of magnitude faster than
+        # path enumeration for deep, inbred pedigrees.
+        kinship_memo: dict[tuple[int, int], float] = {}
 
         pairs_to_compute = []
         for i in range(n):
@@ -2201,9 +2244,7 @@ class BreedingCacheWorker(QThread):
             b = alive[j]
             pk = cache._pair_key(a.db_key, b.db_key)
 
-            pa = paths_batch.get(a.db_key, {})
-            pb = paths_batch.get(b.db_key, {})
-            raw = _raw_coi_from_paths(pa, pb)
+            raw = _kinship(a, b, kinship_memo)
             cache.risk_pct[pk] = max(0.0, min(100.0, _combined_malady_chance(raw) * 100.0))
 
             da = cache.ancestor_depths.get(a.db_key, {})
@@ -5026,7 +5067,7 @@ class RoomOptimizerView(QWidget):
         controls.addWidget(self._max_risk_label)
 
         self._max_risk_input = QLineEdit()
-        self._max_risk_input.setPlaceholderText("20")
+        self._max_risk_input.setPlaceholderText("10")
         self._max_risk_input.setFixedWidth(60)
         self._max_risk_input.setStyleSheet(
             "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
@@ -5182,13 +5223,13 @@ class RoomOptimizerView(QWidget):
             "QTabBar::tab:hover { background:#1e1e3a; color:#bbb; }"
         )
 
-        # Tab 1: Cat Locator
-        self._cat_locator = RoomOptimizerCatLocator()
-        self._bottom_tabs.addTab(self._cat_locator, "Cat Locator")
-
-        # Tab 2: Breeding Pairs (existing detail panel)
+        # Tab 1: Breeding Pairs (existing detail panel)
         self._details_pane = RoomOptimizerDetailPanel()
         self._bottom_tabs.addTab(self._details_pane, "Breeding Pairs")
+
+        # Tab 2: Cat Locator
+        self._cat_locator = RoomOptimizerCatLocator()
+        self._bottom_tabs.addTab(self._cat_locator, "Cat Locator")
 
         self._splitter.addWidget(self._bottom_tabs)
         self._splitter.setSizes([180, 420])
@@ -5271,7 +5312,7 @@ class RoomOptimizerView(QWidget):
         except ValueError:
             pass
 
-        max_risk = 100.0
+        max_risk = 10.0
         try:
             if self._max_risk_input.text().strip():
                 max_risk = float(self._max_risk_input.text().strip())
@@ -6487,7 +6528,7 @@ class PerfectCatPlannerView(QWidget):
         controls.addWidget(self._max_risk_label)
 
         self._max_risk_input = QLineEdit()
-        self._max_risk_input.setPlaceholderText("0")
+        self._max_risk_input.setPlaceholderText("10")
         self._max_risk_input.setFixedWidth(60)
         self._max_risk_input.setStyleSheet(
             "QLineEdit { background:#0d0d1c; color:#ccc; border:1px solid #2a2a4a;"
@@ -6668,7 +6709,7 @@ class PerfectCatPlannerView(QWidget):
         except ValueError:
             pass
 
-        max_risk = 0.0
+        max_risk = 10.0
         try:
             if self._max_risk_input.text().strip():
                 max_risk = float(self._max_risk_input.text().strip())
@@ -7926,9 +7967,9 @@ class MutationDisorderPlannerView(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
-        self._cat_table = QTableWidget(0, 6)
+        self._cat_table = QTableWidget(0, 7)
         self._cat_table.setHorizontalHeaderLabels([
-            "Name", "Gender", "Age", "Mutations", "Passives / Disorders", "Abilities",
+            "Name", "Gender", "Age", "Sum", "Mutations", "Passives / Disorders", "Abilities",
         ])
         self._cat_table.verticalHeader().setVisible(False)
         self._cat_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -7940,12 +7981,15 @@ class MutationDisorderPlannerView(QWidget):
         hh.setSectionResizeMode(0, QHeaderView.Interactive)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
         hh.setSectionResizeMode(4, QHeaderView.Stretch)
         hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        hh.setSectionResizeMode(6, QHeaderView.Stretch)
         self._cat_table.setColumnWidth(0, 130)
         self._cat_table.setColumnWidth(1, 50)
         self._cat_table.setColumnWidth(2, 40)
+        self._cat_table.setColumnWidth(3, 50)
+        self._cat_table.sortByColumn(0, Qt.AscendingOrder)
         self._cat_table.selectionModel().selectionChanged.connect(self._on_selection_changed)
         left_layout.addWidget(self._cat_table)
         splitter.addWidget(left)
@@ -8652,14 +8696,20 @@ class MutationDisorderPlannerView(QWidget):
             age_item.setTextAlignment(Qt.AlignCenter)
             self._cat_table.setItem(row, 2, age_item)
 
+            stat_sum = sum(cat.base_stats.values()) if cat.base_stats else 0
+            sum_item = _SortByUserRoleItem(str(stat_sum))
+            sum_item.setData(Qt.UserRole, stat_sum)
+            sum_item.setTextAlignment(Qt.AlignCenter)
+            self._cat_table.setItem(row, 3, sum_item)
+
             muts = ", ".join(_mutation_display_name(m) for m in cat.mutations) if cat.mutations else "—"
-            self._cat_table.setItem(row, 3, QTableWidgetItem(muts))
+            self._cat_table.setItem(row, 4, QTableWidgetItem(muts))
 
             passives = ", ".join(_mutation_display_name(p) for p in cat.passive_abilities) if cat.passive_abilities else "—"
-            self._cat_table.setItem(row, 4, QTableWidgetItem(passives))
+            self._cat_table.setItem(row, 5, QTableWidgetItem(passives))
 
             abils = ", ".join(_mutation_display_name(a) for a in cat.abilities) if cat.abilities else "—"
-            self._cat_table.setItem(row, 5, QTableWidgetItem(abils))
+            self._cat_table.setItem(row, 6, QTableWidgetItem(abils))
         self._cat_table.setSortingEnabled(True)
 
     def _on_stim_changed(self):
@@ -9536,6 +9586,7 @@ class MainWindow(QMainWindow):
         self._table = QTableView()
         self._table.setModel(self._proxy_model)
         self._table.setSortingEnabled(True)
+        self._table.sortByColumn(COL_NAME, Qt.AscendingOrder)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._table.setAlternatingRowColors(True)
