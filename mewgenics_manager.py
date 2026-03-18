@@ -146,11 +146,11 @@ STAT_COLORS = {
 }
 
 ROOM_DISPLAY = {
-    "Floor1_Large":   "Ground Floor Left",
-    "Floor1_Small":   "Ground Floor Right",
-    "Floor2_Large":   "Second Floor Right",
-    "Floor2_Small":   "Second Floor Left",
-    "Attic":          "Attic",
+    "Floor1_Large":   "一楼左侧",
+    "Floor1_Small":   "一楼右侧",
+    "Floor2_Large":   "二楼右侧",
+    "Floor2_Small":   "二楼左侧",
+    "Attic":          "阁楼",
 }
 
 ROOM_COLORS = {
@@ -167,9 +167,9 @@ DONATION_MAX_TOP_STAT = 6
 
 # Full status → abbreviated display in table cell
 STATUS_ABBREV = {
-    "In House":  "House",
-    "Adventure": "Away",
-    "Gone":      "Gone",
+    "In House":  "在家",
+    "Adventure": "外出",
+    "Gone":      "离开",
 }
 STATUS_COLOR = {
     "In House":  QColor(50,  170, 110),
@@ -2147,9 +2147,9 @@ def can_breed(a: Cat, b: Cat) -> tuple[bool, str]:
         return True, ""
     # Same known sex (no sexuality override)
     if ga == "female" and gb == "female":
-        return False, "Both cats are female — cannot produce offspring"
+        return False, "两只猫均为雌性 — 无法繁殖后代"
     if ga == "male" and gb == "male":
-        return False, "Both cats are male — cannot produce offspring"
+        return False, "两只猫均为雄性 — 无法繁殖后代"
     return False, "Cats have incompatible genders — cannot produce offspring"
 
 
@@ -3018,7 +3018,7 @@ def _load_must_breed(save_path: str, cats: list[Cat]):
 
 # ── Qt table model ────────────────────────────────────────────────────────────
 
-COLUMNS   = ["Name", "Age", "♀/♂", "Room", "Status", "BL", "MB"] + STAT_NAMES + ["Sum", "Abilities", "Mutations", "Relations", "Risk%", "Agg", "Lib", "Inbred", "Sexuality", "Gen", "Source"]
+COLUMNS   = ["名称", "年龄", "♀/♂", "房间", "状态", "BL", "MB"] + STAT_NAMES + ["合计", "能力", "变异", "关系", "风险%", "攻击性", "性欲", "近亲度", "性取向", "代数", "来源"]
 COL_NAME  = 0
 COL_AGE   = 1
 COL_GEN   = 2
@@ -3374,7 +3374,7 @@ class CatTableModel(QAbstractTableModel):
                 return "\n".join(lines)
             if col == COL_AGG:
                 if cat.aggression is None:
-                    return "Aggression: unknown"
+                    return "攻击性: 未知"
                 return f"Aggression: {cat.aggression:.3f} ({_trait_label_from_value('aggression', cat.aggression)})"
             if col == COL_LIB:
                 if cat.libido is None:
@@ -3385,7 +3385,7 @@ class CatTableModel(QAbstractTableModel):
                     return "Inbredness: unknown"
                 return f"Inbredness: {cat.inbredness:.3f} ({_trait_label_from_value('inbredness', cat.inbredness)})"
             if col == COL_SUM:
-                notes: list[str] = [f"Base stat sum: {_cat_base_sum(cat)}"]
+                notes: list[str] = [f"基础属性总和: {_cat_base_sum(cat)}"]
                 if is_exceptional:
                     notes.append(f"Exceptional threshold: >= {EXCEPTIONAL_SUM_THRESHOLD}")
                 if donation_reason:
@@ -3724,7 +3724,7 @@ class CatDetailPanel(QWidget):
 
         def _navigate(target: Cat):
             mw = self.window()
-            # Use "All Cats" view so gone/adventure cats are always reachable
+            # Use "全部猫咪" view so gone/adventure cats are always reachable
             mw._filter("__all__", mw._btn_everyone)
             for row in range(mw._source_model.rowCount()):
                 if mw._source_model.cat_at(row) is target:
@@ -3739,7 +3739,7 @@ class CatDetailPanel(QWidget):
                     break
 
         if self._show_lineage:
-            tree_btn = QPushButton("Family Tree…")
+            tree_btn = QPushButton("家谱…")
             tree_btn.setStyleSheet(
                 "QPushButton { color:#5a8aaa; background:transparent; border:1px solid #252545;"
                 " padding:3px 8px; border-radius:4px; font-size:10px; }"
@@ -3748,7 +3748,7 @@ class CatDetailPanel(QWidget):
             id_col.addWidget(tree_btn)
 
         # Blacklist toggle button
-        blacklist_btn = QPushButton("✓ Include in Breeding" if not cat.is_blacklisted else "✗ Exclude from Breeding")
+        blacklist_btn = QPushButton("✓ 加入育种" if not cat.is_blacklisted else "✗ 排除育种")
         blacklist_btn.setStyleSheet(
             "QPushButton { color:#888; background:transparent; border:1px solid #252545;"
             " padding:3px 8px; border-radius:4px; font-size:10px; }"
@@ -3758,7 +3758,7 @@ class CatDetailPanel(QWidget):
             if cat.is_blacklisted:
                 cat.must_breed = False
             blacklist_btn.setText("✓ Include in Breeding" if not cat.is_blacklisted else "✗ Exclude from Breeding")
-            must_breed_btn.setText("★ Must Breed" if cat.must_breed else "☆ Normal Priority")
+            must_breed_btn.setText("★ 必须育种" if cat.must_breed else "☆ 正常优先级")
             mw = self.window()
             if hasattr(mw, "_source_model") and mw._source_model is not None:
                 for row in range(mw._source_model.rowCount()):
@@ -3806,7 +3806,7 @@ class CatDetailPanel(QWidget):
         if cat.abilities or cat.passive_abilities:
             root.addWidget(_vsep())
             ab = QVBoxLayout(); ab.setSpacing(4)
-            ab.addWidget(_sec("ABILITIES"))
+            ab.addWidget(_sec("能力"))
             ab.addWidget(ChipRow(cat.abilities, tooltip_fn=_ability_tip))
             if cat.passive_abilities:
                 ab.addWidget(_sec("PASSIVE"))
@@ -3924,7 +3924,7 @@ class CatDetailPanel(QWidget):
                 hdr.addWidget(x)
 
         hdr.addStretch()
-        stim_lbl = QLabel("Stimulation")
+        stim_lbl = QLabel("刺激度")
         stim_lbl.setStyleSheet(_META_STYLE)
         hdr.addWidget(stim_lbl)
         stim_box = QSpinBox()
@@ -3979,7 +3979,7 @@ class CatDetailPanel(QWidget):
             h.setAlignment(Qt.AlignCenter)
             grid.addWidget(h, 0, j + 1)
         sum_col = len(STAT_NAMES) + 1
-        sh = QLabel("Sum")
+        sh = QLabel("合计")
         sh.setStyleSheet("color:#455; font-size:9px; font-weight:bold;")
         sh.setAlignment(Qt.AlignCenter)
         grid.addWidget(sh, 0, sum_col)
@@ -4005,7 +4005,7 @@ class CatDetailPanel(QWidget):
                 lbl_hb.addWidget(name_lbl)
                 lbl_hb.addWidget(gen_lbl)
             else:
-                off_lbl = QLabel("Offspring")
+                off_lbl = QLabel("后代")
                 off_lbl.setStyleSheet("color:#555; font-size:10px; font-style:italic;")
                 lbl_hb.addWidget(off_lbl)
 
@@ -4157,24 +4157,24 @@ class CatDetailPanel(QWidget):
         inh_note.setWordWrap(True)
         inh.addWidget(inh_note)
 
-        active_label = QLabel("Active spell candidates", styleSheet="color:#555; font-size:10px;")
+        active_label = QLabel("主动法术候选", styleSheet="color:#555; font-size:10px;")
         inh.addWidget(active_label)
         if active_candidates:
             inh.addWidget(_wrapped_chip_block(active_candidates, max_per_row=5))
         else:
-            inh.addWidget(QLabel("No active ability candidates.", styleSheet=_META_STYLE))
+            inh.addWidget(QLabel("无主动能力候选。", styleSheet=_META_STYLE))
 
-        passive_label = QLabel("Passive candidates", styleSheet="color:#555; font-size:10px;")
+        passive_label = QLabel("被动能力候选", styleSheet="color:#555; font-size:10px;")
         inh.addWidget(passive_label)
         if passive_candidates:
             inh.addWidget(_wrapped_chip_block(passive_candidates, max_per_row=4))
         else:
-            inh.addWidget(QLabel("No passive candidates.", styleSheet=_META_STYLE))
+            inh.addWidget(QLabel("无被动能力候选。", styleSheet=_META_STYLE))
 
         # ── Trait inheritance probabilities ──
         trait_probs = _trait_inheritance_probabilities(a, b, stim)
         if trait_probs:
-            inh.addWidget(QLabel("Trait inheritance chances", styleSheet="color:#555; font-size:10px;"))
+            inh.addWidget(QLabel("特征遗传概率", styleSheet="color:#555; font-size:10px;"))
             prob_chips: list[tuple[str, str]] = []
             for display, category, prob, detail in trait_probs:
                 pct = prob * 100
@@ -4189,7 +4189,7 @@ class CatDetailPanel(QWidget):
         disorder_ch, part_defect_ch, combined_ch = _malady_breakdown(coi)
         risk_row = QHBoxLayout()
         risk_row.setSpacing(8)
-        risk_row.addWidget(QLabel("Risk:", styleSheet="color:#555; font-size:10px;"))
+        risk_row.addWidget(QLabel("风险:", styleSheet="color:#555; font-size:10px;"))
 
         def _risk_chip(text: str, value: float) -> QLabel:
             c = _chip(text)
@@ -4226,7 +4226,7 @@ class CatDetailPanel(QWidget):
 
         bp_col = QVBoxLayout()
         bp_col.setSpacing(6)
-        bp_col.addWidget(_sec("BREAKPOINT HINTS"))
+        bp_col.addWidget(_sec("突破点提示"))
         bp_note = QLabel(
             f"{breakpoint_info['headline']}  |  "
             f"Sum range {breakpoint_info['sum_range'][0]}-{breakpoint_info['sum_range'][1]}  |  "
@@ -4302,8 +4302,8 @@ class CatDetailPanel(QWidget):
 
         app_col = QVBoxLayout()
         app_col.setSpacing(6)
-        app_col.addWidget(_sec("APPEARANCE PREVIEW"))
-        app_note = QLabel("Probabilistic preview from parent coat/body/part data.")
+        app_col.addWidget(_sec("外观预览"))
+        app_note = QLabel("基于父母毛色/身体/部位数据的概率预览。")
         app_note.setStyleSheet(_META_STYLE)
         app_note.setWordWrap(True)
         app_col.addWidget(app_note)
@@ -4336,7 +4336,7 @@ class CatDetailPanel(QWidget):
             app_col.addLayout(row)
 
         if not shown_preview:
-            app_col.addWidget(QLabel("No distinct parent appearance data detected.", styleSheet=_META_STYLE))
+            app_col.addWidget(QLabel("未检测到明显的父母外观数据。", styleSheet=_META_STYLE))
 
         app_col.addStretch()
         bot.addLayout(app_col, 1)
@@ -4352,18 +4352,18 @@ class CatDetailPanel(QWidget):
             is_haters = (b in getattr(a, 'haters', []) or a in getattr(b, 'haters', []))
 
             if is_haters:
-                lc.addWidget(QLabel("⚠  These cats hate each other", styleSheet=_WARN_STYLE))
+                lc.addWidget(QLabel("⚠  这两只猫互相厌恶", styleSheet=_WARN_STYLE))
             if is_direct:
-                lc.addWidget(QLabel("⚠  Direct parent/offspring", styleSheet=_WARN_STYLE))
+                lc.addWidget(QLabel("⚠  直系亲属关系", styleSheet=_WARN_STYLE))
             elif common:
                 lc.addWidget(QLabel(
                     f"⚠  {len(common)} shared ancestor{'s' if len(common) > 1 else ''}: "
                     + "  ·  ".join(c.short_name for c in common[:6]),
                     styleSheet=_WARN_STYLE))
             elif get_parents(a) or get_parents(b):
-                lc.addWidget(QLabel("✓  No shared ancestors", styleSheet=_SAFE_STYLE))
+                lc.addWidget(QLabel("✓  无共同祖先", styleSheet=_SAFE_STYLE))
             else:
-                lc.addWidget(QLabel("—  Lineage unknown", styleSheet=_META_STYLE))
+                lc.addWidget(QLabel("—  血统未知", styleSheet=_META_STYLE))
 
             lc.addStretch()
             bot.addLayout(lc)
@@ -4382,7 +4382,7 @@ class LineageDialog(QDialog):
 
     def __init__(self, cat: 'Cat', parent=None, navigate_fn=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Family Tree — {cat.name}")
+        self.setWindowTitle(f"家谱 — {cat.name}")
         self.setMinimumSize(700, 400)
         self.setStyleSheet(
             "QDialog { background:#0a0a18; }"
@@ -4399,7 +4399,7 @@ class LineageDialog(QDialog):
         # ── Reusable box builder ─────────────────────────────────────────
         def cat_box(cat_obj, highlight=False, dim=False):
             if cat_obj is None:
-                btn = QPushButton("Unknown")
+                btn = QPushButton("未知")
                 btn.setEnabled(False)
                 btn.setStyleSheet(
                     "QPushButton { color:#252535; font-size:10px; padding:6px 10px;"
@@ -4465,21 +4465,21 @@ class LineageDialog(QDialog):
         make_gen_row("PARENTS",      parents)
         make_gen_row("",             [cat], highlight_all=True)
         if children:
-            make_gen_row("CHILDREN", children[:8])
+            make_gen_row("子女", children[:8])
             if len(children) > 8:
                 outer.addWidget(
-                    QLabel(f"  … and {len(children)-8} more children",
+                    QLabel(f"  … 还有 {len(children)-8} 个子女",
                            styleSheet="color:#444; font-size:10px; padding-left:100px;"))
         if grandchildren:
             unique_gc = list({id(g): g for g in grandchildren}.values())
             make_gen_row("GRANDCHILDREN", unique_gc[:8])
             if len(unique_gc) > 8:
                 outer.addWidget(
-                    QLabel(f"  … and {len(unique_gc)-8} more grandchildren",
+                    QLabel(f"  … 还有 {len(unique_gc)-8} 个孙辈",
                            styleSheet="color:#444; font-size:10px; padding-left:100px;"))
 
         outer.addStretch()
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         outer.addWidget(close_btn, alignment=Qt.AlignRight)
         _enforce_min_font_in_widget_tree(self)
@@ -4514,7 +4514,7 @@ class FamilyTreeBrowserView(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(8)
-        lv.addWidget(QLabel("Cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        lv.addWidget(QLabel("猫咪", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
         mode_row.setSpacing(6)
@@ -4529,7 +4529,7 @@ class FamilyTreeBrowserView(QWidget):
         mode_row.addWidget(self._alive_btn)
         lv.addLayout(mode_row)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search cat name…")
+        self._search.setPlaceholderText("搜索猫咪名称…")
         lv.addWidget(self._search)
         self._list = QListWidget()
         lv.addWidget(self._list, 1)
@@ -4635,14 +4635,14 @@ class FamilyTreeBrowserView(QWidget):
         root.setSpacing(10)
 
         if cat is None:
-            root.addWidget(QLabel("No cats match the current filter.", styleSheet="color:#666; font-size:12px;"))
+            root.addWidget(QLabel("没有猫咪符合当前筛选条件。", styleSheet="color:#666; font-size:12px;"))
             root.addStretch()
             return
 
         title = QLabel(f"Family Tree — {cat.name}")
         title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
         root.addWidget(title)
-        root.addWidget(QLabel("Click any box to jump to that cat.", styleSheet="color:#666; font-size:11px;"))
+        root.addWidget(QLabel("点击任意方框跳转到该猫咪。", styleSheet="color:#666; font-size:11px;"))
 
         def cat_box(c: Optional[Cat], highlight=False):
             if c is None:
@@ -4764,14 +4764,14 @@ class FamilyTreeBrowserView(QWidget):
             add_arrow()
             add_generation_row("CHILDREN", children[:10])
             if len(children) > 10:
-                root.addWidget(QLabel(f"… and {len(children)-10} more children", styleSheet="color:#555; font-size:10px;"))
+                root.addWidget(QLabel(f"… 还有 {len(children)-10} 个子女", styleSheet="color:#555; font-size:10px;"))
         if grandchildren:
             add_arrow()
             add_generation_row("GRANDCHILDREN", grandchildren[:10])
             if len(grandchildren) > 10:
-                root.addWidget(QLabel(f"… and {len(grandchildren)-10} more grandchildren", styleSheet="color:#555; font-size:10px;"))
+                root.addWidget(QLabel(f"… 还有 {len(grandchildren)-10} 个孙辈", styleSheet="color:#555; font-size:10px;"))
         if not any([ancestor_levels, children, grandchildren]):
-            root.addWidget(QLabel("No known lineage data for this cat yet.", styleSheet="color:#666; font-size:12px;"))
+            root.addWidget(QLabel("该猫咪暂无已知血统数据。", styleSheet="color:#666; font-size:12px;"))
 
         root.addStretch()
         _enforce_min_font_in_widget_tree(self._tree_content)
@@ -4842,7 +4842,7 @@ class SafeBreedingView(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(8)
-        lv.addWidget(QLabel("Alive cats", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
+        lv.addWidget(QLabel("存活猫咪", styleSheet="color:#666; font-size:10px; font-weight:bold;"))
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search cat name…")
         lv.addWidget(self._search)
@@ -4854,12 +4854,12 @@ class SafeBreedingView(QWidget):
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(8)
-        self._title = QLabel("Safe Breeding")
+        self._title = QLabel("安全育种")
         self._title.setStyleSheet("color:#ddd; font-size:16px; font-weight:bold;")
         self._summary = QLabel("")
         self._summary.setStyleSheet("color:#666; font-size:11px;")
         self._table = QTableWidget(0, 4)
-        self._table.setHorizontalHeaderLabels(["Cat", "Risk%", "Shared Anc.", "Children will be"])
+        self._table.setHorizontalHeaderLabels(["猫咪", "风险%", "共同祖先", "后代状态"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -4970,11 +4970,11 @@ class SafeBreedingView(QWidget):
         self._table_row_cat_keys = []
         if cat is None:
             self._title.setText("Safe Breeding")
-            self._summary.setText("Select an alive cat.")
+            self._summary.setText("请选择一只存活的猫咪。")
             return
 
         cache = self._cache
-        self._title.setText(f"Safe Breeding — {cat.name}")
+        self._title.setText(f"安全育种 — {cat.name}")
         candidates: list[tuple[float, int, int, Cat]] = []
         for other in self._alive:
             if other is cat:
@@ -5009,7 +5009,7 @@ class SafeBreedingView(QWidget):
 
         self._summary.setText(
             f"{len(candidates)} possible alive candidates  |  "
-            "Risk% = combined birth-defect probability from game CoI formula"
+            "风险% = 基于游戏近交系数公式的先天缺陷概率"
         )
         self._table.setRowCount(len(candidates))
         for row, (rel, packed_shared, closest_recent_gen, other) in enumerate(candidates):
@@ -5061,7 +5061,7 @@ class BreedingPartnersView(QWidget):
         root.setSpacing(10)
 
         header = QHBoxLayout()
-        self._title = QLabel("Breeding Partners")
+        self._title = QLabel("育种伴侣")
         self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
         self._summary = QLabel("")
         self._summary.setStyleSheet("color:#666; font-size:11px;")
@@ -5071,11 +5071,11 @@ class BreedingPartnersView(QWidget):
         root.addLayout(header)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search partner names or rooms…")
+        self._search.setPlaceholderText("搜索伴侣名称或房间…")
         root.addWidget(self._search)
 
         self._table = QTableWidget(0, 5)
-        self._table.setHorizontalHeaderLabels(["Cat A", "Cat B", "Room A", "Room B", "Status"])
+        self._table.setHorizontalHeaderLabels(["猫咪A", "猫咪B", "房间A", "房间B", "状态"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.NoSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -5159,7 +5159,7 @@ class BreedingPartnersView(QWidget):
 
         total = len(self._pairs)
         shown = len(pairs)
-        self._summary.setText(f"{shown} / {total} mutual-lover pairs  |  mismatches: {mismatch_count}")
+        self._summary.setText(f"{shown} / {total} 互相爱恋配对  |  房间不匹配: {mismatch_count}")
 
 
 # ── Room Optimizer View ───────────────────────────────────────────────────────
@@ -5201,7 +5201,7 @@ class RoomOptimizerView(QWidget):
 
         # Header
         header = QHBoxLayout()
-        self._title = QLabel("Room Distribution Optimizer")
+        self._title = QLabel("房间分配优化器")
         self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
         self._summary = QLabel("")
         self._summary.setStyleSheet("color:#666; font-size:11px;")
@@ -5224,7 +5224,7 @@ class RoomOptimizerView(QWidget):
         controls.setSpacing(8)
         controls.setContentsMargins(0, 0, 0, 0)
 
-        self._min_stats_label = QLabel("Min base stats:")
+        self._min_stats_label = QLabel("最低基础属性：")
         self._min_stats_label.setStyleSheet("color:#888; font-size:11px;")
         controls.addWidget(self._min_stats_label)
 
@@ -5239,7 +5239,7 @@ class RoomOptimizerView(QWidget):
 
         controls.addSpacing(16)
 
-        self._max_risk_label = QLabel("Max inbreeding risk %:")
+        self._max_risk_label = QLabel("最高近亲风险%：")
         self._max_risk_label.setStyleSheet("color:#888; font-size:11px;")
         controls.addWidget(self._max_risk_label)
 
@@ -5254,7 +5254,7 @@ class RoomOptimizerView(QWidget):
 
         controls.addSpacing(16)
 
-        self._optimize_btn = QPushButton("Calculate Optimal Distribution")
+        self._optimize_btn = QPushButton("计算最优分配")
         self._optimize_btn.clicked.connect(self._calculate_optimal_distribution)
         self._optimize_btn.setStyleSheet(
             "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
@@ -5266,7 +5266,7 @@ class RoomOptimizerView(QWidget):
 
         controls.addSpacing(8)
 
-        self._mode_toggle_btn = QPushButton("Mode: Pair Quality")
+        self._mode_toggle_btn = QPushButton("模式：配对质量")
         self._mode_toggle_btn.setCheckable(True)
         self._mode_toggle_btn.setChecked(False)
         self._mode_toggle_btn.setToolTip(
@@ -5294,7 +5294,7 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#2a4a5a; color:#ddd; border:1px solid #4a6a7a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._bind_persistent_toggle(self._minimize_variance_checkbox, "Minimize Variance", "minimize_variance")
+        self._bind_persistent_toggle(self._minimize_variance_checkbox, "最小化方差", "minimize_variance")
         controls.addWidget(self._minimize_variance_checkbox)
 
         self._avoid_lovers_checkbox = QPushButton()
@@ -5309,7 +5309,7 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#5a3a2a; color:#ddd; border:1px solid #8a5a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._bind_persistent_toggle(self._avoid_lovers_checkbox, "Avoid Lovers", "avoid_lovers")
+        self._bind_persistent_toggle(self._avoid_lovers_checkbox, "避开恋人", "avoid_lovers")
         controls.addWidget(self._avoid_lovers_checkbox)
 
         self._prefer_low_aggression_checkbox = QPushButton()
@@ -5324,7 +5324,7 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#4a2a2a; color:#ddd; border:1px solid #7a4a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._bind_persistent_toggle(self._prefer_low_aggression_checkbox, "Prefer Low Aggression", "prefer_low_aggression")
+        self._bind_persistent_toggle(self._prefer_low_aggression_checkbox, "偏好低攻击性", "prefer_low_aggression")
         controls.addWidget(self._prefer_low_aggression_checkbox)
 
         self._prefer_high_libido_checkbox = QPushButton()
@@ -5339,11 +5339,11 @@ class RoomOptimizerView(QWidget):
             "QPushButton:checked { background:#2a4a36; color:#ddd; border:1px solid #4a7a5a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
         )
-        self._bind_persistent_toggle(self._prefer_high_libido_checkbox, "Prefer High Libido", "prefer_high_libido")
+        self._bind_persistent_toggle(self._prefer_high_libido_checkbox, "偏好高性欲", "prefer_high_libido")
         controls.addWidget(self._prefer_high_libido_checkbox)
 
         controls.addSpacing(16)
-        self._import_planner_btn = QPushButton("Import Breeding Planner")
+        self._import_planner_btn = QPushButton("导入育种规划")
         self._import_planner_btn.setToolTip(
             "Import weighted trait selections from the Mutation & Disorder Planner.\n"
             "The optimizer will boost pairs that carry the selected traits."
@@ -5367,7 +5367,7 @@ class RoomOptimizerView(QWidget):
         # Results table
         self._table = QTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels([
-            "Room", "Cats to Place", "Expected Pairs", "Avg Stats", "Risk%", "Details"
+            "Room", "Cats to Place", "Expected Pairs", "平均属性", "Risk%", "Details"
         ])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -5418,7 +5418,7 @@ class RoomOptimizerView(QWidget):
 
     def _on_optimizer_mode_toggled(self, enabled: bool):
         if enabled:
-            self._mode_toggle_btn.setText("Mode: Family Separation")
+            self._mode_toggle_btn.setText("模式：家族分离")
             self._minimize_variance_checkbox.setChecked(False)
             self._minimize_variance_checkbox.setEnabled(False)
             self._minimize_variance_checkbox.setToolTip(
@@ -5449,9 +5449,9 @@ class RoomOptimizerView(QWidget):
         alive_count = len([c for c in cats if c.status != 'Gone'])
         excluded_count = len([c for c in cats if c.status != 'Gone' and c.db_key in self._excluded_keys])
         if excluded_count > 0:
-            self._summary.setText(f"{alive_count} alive cats available ({excluded_count} excluded from breeding)")
+            self._summary.setText(f"{alive_count} 只存活猫咪可用（{excluded_count} 只已排除育种）")
         else:
-            self._summary.setText(f"{alive_count} alive cats available")
+            self._summary.setText(f"{alive_count} 只存活猫咪可用")
 
     def _navigate_to_cat_from_breeding_pairs(self, cat_name_formatted: str):
         """Navigate to a cat by its formatted name (e.g. 'Fluffy (Female)')."""
@@ -5478,13 +5478,13 @@ class RoomOptimizerView(QWidget):
         self._planner_traits = self._planner_view.get_selected_traits()
         if not self._planner_traits:
             self._import_planner_btn.setText("Import Breeding Planner")
-            self._import_planner_btn.setToolTip("No traits selected in the planner. Select traits first.")
+            self._import_planner_btn.setToolTip("规划器中未选择特征，请先选择特征。")
             return
         names = [f"{t['display'].split('] ')[-1]}({t['weight']})" for t in self._planner_traits[:4]]
         summary = ", ".join(names)
         if len(self._planner_traits) > 4:
             summary += f" +{len(self._planner_traits) - 4} more"
-        self._import_planner_btn.setText(f"Imported: {summary}")
+        self._import_planner_btn.setText(f"已导入: {summary}")
         self._import_planner_btn.setStyleSheet(
             "QPushButton { background:#2a3a5a; color:#aaddff; border:1px solid #4a6a9a; "
             "border-radius:4px; padding:6px 12px; font-size:11px; }"
@@ -5522,7 +5522,7 @@ class RoomOptimizerView(QWidget):
         }
 
         self._optimize_btn.setEnabled(False)
-        self._summary.setText("Calculating…")
+        self._summary.setText("计算中…")
 
         worker = RoomOptimizerWorker(
             self._cats,
@@ -6062,7 +6062,7 @@ class RoomOptimizerCatLocator(QWidget):
         root.addWidget(self._summary)
 
         self._table = QTableWidget(0, 5)
-        self._table.setHorizontalHeaderLabels(["Cat", "Age", "Currently In", "Move To", "Action"])
+        self._table.setHorizontalHeaderLabels(["Cat", "Age", "Currently In", "Move To", "操作"])
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -6203,12 +6203,12 @@ class RoomOptimizerDetailPanel(QWidget):
         # Header with summary label and best pairs toggle
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
-        self._summary = QLabel("Select a room to see pair details.")
+        self._summary = QLabel("选择一个房间查看配对详情。")
         self._summary.setStyleSheet("color:#aaa; font-size:12px;")
         self._summary.setWordWrap(True)
         hdr.addWidget(self._summary, 1)
 
-        self._best_pairs_btn = QPushButton("All Pairs")
+        self._best_pairs_btn = QPushButton("全部配对")
         self._best_pairs_btn.setCheckable(True)
         self._best_pairs_btn.setChecked(False)
         self._best_pairs_btn.setFixedWidth(90)
@@ -6218,7 +6218,7 @@ class RoomOptimizerDetailPanel(QWidget):
             "QPushButton:hover { background:#252555; }"
             "QPushButton:checked { background:#3a5a7a; color:#fff; }"
         )
-        self._best_pairs_btn.setToolTip("Best Pairs: one unique match per cat\nAll Pairs: every valid combination")
+        self._best_pairs_btn.setToolTip("最佳配对：每只猫唯一匹配\n全部配对：所有有效组合")
         self._best_pairs_btn.clicked.connect(self._on_toggle_best_pairs)
         hdr.addWidget(self._best_pairs_btn)
 
@@ -6315,7 +6315,7 @@ class RoomOptimizerDetailPanel(QWidget):
     def _on_toggle_best_pairs(self):
         """Re-render pairs table based on toggle state."""
         checked = self._best_pairs_btn.isChecked()
-        self._best_pairs_btn.setText("Best Pairs" if checked else "All Pairs")
+        self._best_pairs_btn.setText("最佳配对" if checked else "All Pairs")
         if self._current_data:
             self.show_room(self._current_data)
 
@@ -6748,7 +6748,7 @@ class PerfectCatPlannerView(QWidget):
         root.setSpacing(12)
 
         header = QHBoxLayout()
-        self._title = QLabel("Perfect 7 Planner")
+        self._title = QLabel("完美七值规划")
         self._title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
         self._summary = QLabel("")
         self._summary.setStyleSheet("color:#666; font-size:11px;")
@@ -6806,7 +6806,7 @@ class PerfectCatPlannerView(QWidget):
 
         controls.addSpacing(12)
 
-        starter_label = QLabel("Start pairs:")
+        starter_label = QLabel("起始配对数：")
         starter_label.setStyleSheet("color:#888; font-size:11px;")
         controls.addWidget(starter_label)
         self._starter_pairs_input = QSpinBox()
@@ -6820,7 +6820,7 @@ class PerfectCatPlannerView(QWidget):
 
         controls.addSpacing(12)
 
-        stimulation_label = QLabel("Stimulation:")
+        stimulation_label = QLabel("刺激度：")
         stimulation_label.setStyleSheet("color:#888; font-size:11px;")
         controls.addWidget(stimulation_label)
         self._stimulation_input = QSpinBox()
@@ -6834,7 +6834,7 @@ class PerfectCatPlannerView(QWidget):
 
         controls.addSpacing(12)
 
-        self._plan_btn = QPushButton("Build Perfect 7 Plan")
+        self._plan_btn = QPushButton("生成完美七值计划")
         self._plan_btn.setStyleSheet(
             "QPushButton { background:#1f5f4a; color:#f2f7f3; border:1px solid #3f8f72; "
             "border-radius:4px; padding:6px 14px; font-size:11px; font-weight:bold; }"
@@ -6997,7 +6997,7 @@ class PerfectCatPlannerView(QWidget):
             self._table.setRowCount(0)
             self._details_pane.show_stage(None)
             self._cat_locator.clear()
-            self._summary.setText("Not enough cats to build a plan")
+            self._summary.setText("猫咪数量不足，无法生成计划")
             return
 
         stat_sum = {cat.db_key: sum(cat.base_stats.values()) for cat in alive_cats}
@@ -7190,7 +7190,7 @@ class PerfectCatPlannerView(QWidget):
             self._table.setRowCount(0)
             self._details_pane.show_stage(None)
             self._cat_locator.clear()
-            self._summary.setText("No low-risk unrelated breeding pairs found under the current filters")
+            self._summary.setText("在当前筛选条件下未找到低风险的非近亲育种配对")
             return
 
         def _fmt_stats(stats: list[str]) -> str:
@@ -7302,7 +7302,7 @@ class PerfectCatPlannerView(QWidget):
                 "why": (
                     f"Fast foundation pair for a perfect-7 line. "
                     f"Projected 7+ coverage: {projection['seven_plus_total']:.1f}/7 at stimulation {int(stimulation)}. "
-                    f"Breakpoint: {bp['headline']}. "
+                    f"突破点: {bp['headline']}。"
                     + " ".join(bp["hints"][:2])
                 ),
                 "children": (
@@ -7465,7 +7465,7 @@ class PerfectCatPlannerView(QWidget):
             else:
                 stage4_actions.append({
                     "action": f"Maintain Pair {idx} as a clean 7-line",
-                    "target": "All seven stats already covered",
+                    "target": "七项属性已全部覆盖",
                     "risk": pair["risk"],
                     "why": (
                         "This line already covers every target stat. The goal shifts from climbing to preserving."
@@ -7702,7 +7702,7 @@ class CalibrationView(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        title = QLabel("Calibration")
+        title = QLabel("校准")
         title.setStyleSheet("color:#ddd; font-size:18px; font-weight:bold;")
         root.addWidget(title)
 
@@ -7727,12 +7727,12 @@ class CalibrationView(QWidget):
         actions.addWidget(self._import_btn)
         actions.addSpacing(16)
 
-        bulk_label = QLabel("Bulk Edit Selected:")
+        bulk_label = QLabel("批量编辑选中项：")
         bulk_label.setStyleSheet("color:#888; font-size:11px;")
         actions.addWidget(bulk_label)
 
         self._bulk_sexuality_combo = QComboBox()
-        self._bulk_sexuality_combo.addItems(["Straight", "Gay", "Bi"])
+        self._bulk_sexuality_combo.addItems(["异性恋", "同性恋", "双性恋"])
         self._bulk_sexuality_combo.setFixedWidth(100)
         self._bulk_sexuality_combo.setStyleSheet(
             "QComboBox { background:#1a1a32; color:#ddd; border:1px solid #2a2a4a; padding:2px 6px; }"
@@ -7740,7 +7740,7 @@ class CalibrationView(QWidget):
         )
         actions.addWidget(self._bulk_sexuality_combo)
 
-        self._bulk_apply_btn = QPushButton("Apply Sexuality")
+        self._bulk_apply_btn = QPushButton("应用性取向")
         self._bulk_apply_btn.setStyleSheet(
             "QPushButton { background:#2a3a2a; color:#aaa; border:1px solid #3a5a3a; "
             "border-radius:4px; padding:4px 10px; font-size:10px; }"
@@ -7941,14 +7941,14 @@ class CalibrationView(QWidget):
                 self._table.setItem(row, stat_col, item)
 
         self._table.setSortingEnabled(True)
-        self._status.setText(f"{len(self._cats)} alive cats")
+        self._status.setText(f"{len(self._cats)} 只存活猫咪")
 
     def _reload_clicked(self):
         if not self._save_path:
-            self._status.setText("No save loaded")
+            self._status.setText("未加载存档")
             return
         self.set_context(self._save_path, self._cats)
-        self._status.setText("Reloaded calibration file")
+        self._status.setText("已重新加载校准文件")
 
     def _collect_calibration_data(self) -> dict:
         overrides: dict[str, dict] = {}
@@ -8014,7 +8014,7 @@ class CalibrationView(QWidget):
         data = self._collect_calibration_data()
         overrides = data.get("overrides", {}) if isinstance(data, dict) else {}
         if not _save_calibration_data(self._save_path, data):
-            self._status.setText("Failed to save calibration")
+            self._status.setText("保存校准失败")
             return
 
         explicit, token_applied, _ = _apply_calibration_data(data, self._cats)
@@ -8061,10 +8061,10 @@ class CalibrationView(QWidget):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
-            self._status.setText("Failed to read calibration file")
+            self._status.setText("读取校准文件失败")
             return
         if not isinstance(data, dict):
-            self._status.setText("Invalid calibration format")
+            self._status.setText("校准格式无效")
             return
         overrides = data.get("overrides", {})
         if not isinstance(overrides, dict):
@@ -8078,7 +8078,7 @@ class CalibrationView(QWidget):
             "gender_token_map": token_map or _learn_gender_token_map(self._cats, overrides),
         }
         if not _save_calibration_data(self._save_path, normalized):
-            self._status.setText("Failed to import calibration")
+            self._status.setText("导入校准失败")
             return
         explicit, token_applied, _ = _apply_calibration_data(normalized, self._cats)
         self.set_context(self._save_path, self._cats)
@@ -8091,7 +8091,7 @@ class CalibrationView(QWidget):
         """Apply sexuality to all selected rows."""
         selected_rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
         if not selected_rows:
-            self._status.setText("Select rows to apply sexuality")
+            self._status.setText("请选择行以应用性取向")
             return
 
         sexuality = self._bulk_sexuality_combo.currentText().lower()
@@ -8101,7 +8101,7 @@ class CalibrationView(QWidget):
                 widget.setCurrentText(sexuality)
 
         self._save_clicked()
-        self._status.setText(f"Applied {sexuality} to {len(selected_rows)} cat(s) and saved")
+        self._status.setText(f"已将 {sexuality} 应用于 {len(selected_rows)} 只猫咪并已保存")
 
 _SIDEBAR_BTN = """
 QPushButton {
@@ -8190,7 +8190,7 @@ class MutationDisorderPlannerView(QWidget):
         self._stim_spin.valueChanged.connect(self._on_stim_changed)
         controls.addWidget(self._stim_spin)
         controls.addStretch()
-        self._pair_label = QLabel("Ctrl+click two cats to compare breeding outcomes")
+        self._pair_label = QLabel("Ctrl+点击两只猫咪以比较育种结果")
         self._pair_label.setStyleSheet("color:#666; font-size:11px;")
         controls.addWidget(self._pair_label)
         root.addLayout(controls)
@@ -8217,7 +8217,7 @@ class MutationDisorderPlannerView(QWidget):
         )
         self._trait_combo.currentIndexChanged.connect(self._on_target_trait_changed)
         trait_row.addWidget(self._trait_combo)
-        # "Add" button to add selected trait to the multi-select list
+        # "添加" button to add selected trait to the multi-select list
         self._add_trait_btn = QPushButton("Add")
         self._add_trait_btn.setFixedWidth(50)
         self._add_trait_btn.setStyleSheet(
@@ -8357,7 +8357,7 @@ class MutationDisorderPlannerView(QWidget):
     def _populate_room_filter(self):
         self._room_combo.blockSignals(True)
         self._room_combo.clear()
-        self._room_combo.addItem("All Rooms", "")
+        self._room_combo.addItem("全部房间", "")
         rooms: dict[str, str] = {}
         for cat in self._cats:
             if cat.status == "Gone" or not cat.room or cat.room == "Adventure":
@@ -8417,7 +8417,7 @@ class MutationDisorderPlannerView(QWidget):
     def _apply_trait_filter(self, search: str, restore_data=None):
         self._trait_combo.blockSignals(True)
         self._trait_combo.clear()
-        self._trait_combo.addItem("(none -- select a trait to plan for)", None)
+        self._trait_combo.addItem("（无 — 请选择要规划的特征）", None)
 
         needle = search.strip().lower()
         last_category = None
@@ -8654,7 +8654,7 @@ class MutationDisorderPlannerView(QWidget):
             best_covered = len(scored_pairs[0][3])
             layout.addWidget(self._info_label(
                 f"No single pair covers all {len(pos_traits)} positive traits.\n"
-                f"Best coverage: {best_covered}/{len(pos_traits)} traits."
+                f"最佳覆盖: {best_covered}/{len(pos_traits)} 个特征。"
             ))
 
         # Show top pairs (limit to 20)
@@ -8786,7 +8786,7 @@ class MutationDisorderPlannerView(QWidget):
 
         # Display name for the trait
         trait_display = self._trait_combo.currentText()
-        self._trait_info_label.setText(f"{len(carriers)} carrier(s) found")
+        self._trait_info_label.setText(f"找到 {len(carriers)} 只携带者")
         self._trait_info_label.setStyleSheet(
             f"color:{'#8fb8a0' if carriers else '#cc6666'}; font-size:11px;"
         )
@@ -8798,7 +8798,7 @@ class MutationDisorderPlannerView(QWidget):
             if child.widget():
                 child.widget().deleteLater()
 
-        layout.addWidget(self._sec_label(f"Breeding Plan: {trait_display}"))
+        layout.addWidget(self._sec_label(f"育种计划: {trait_display}"))
 
         # ── Carriers ──
         layout.addWidget(self._sec_label(f"Carriers ({len(carriers)} cats)"))
@@ -9236,7 +9236,7 @@ class MutationDisorderPlannerView(QWidget):
         # ── Stat Inheritance ──
         layout.addWidget(self._sec_label("Stat Inheritance"))
         layout.addWidget(self._info_label(
-            f"Better stat favored at {favor_weight*100:.1f}% (stim {stim})."
+            f"以 {favor_weight*100:.1f}% 偏向更优属性（刺激度 {stim}）。"
         ))
 
         stat_table = QTableWidget(7, 4)
@@ -9307,7 +9307,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, initial_save: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("Mewgenics Breeding Manager")
+        self.setWindowTitle("Mewgenics 育种管理器")
         self.resize(1440, 900)
 
         self._current_save = None
@@ -9359,7 +9359,7 @@ class MainWindow(QMainWindow):
         self._cache_progress.setFixedWidth(200)
         self._cache_progress.setFixedHeight(16)
         self._cache_progress.setTextVisible(True)
-        self._cache_progress.setFormat("Computing breeding data… %p%")
+        self._cache_progress.setFormat("正在计算育种数据… %p%")
         self._cache_progress.setStyleSheet(
             "QProgressBar { background:#1a1a32; border:1px solid #2a2a4a; border-radius:4px; color:#aaa; font-size:10px; }"
             "QProgressBar::chunk { background:#3f8f72; border-radius:3px; }"
@@ -9382,26 +9382,26 @@ class MainWindow(QMainWindow):
         fm = self.menuBar().addMenu("File")
         self._file_menu = fm
 
-        oa = QAction("Open Save File...", self)
+        oa = QAction("打开存档文件...", self)
         oa.setShortcut("Ctrl+O")
         oa.triggered.connect(self._open_file)
         fm.addAction(oa)
 
         # Recent Saves submenu
-        self._recent_saves_menu = fm.addMenu("Recent Saves")
+        self._recent_saves_menu = fm.addMenu("最近存档")
         self._recent_save_actions: list[QAction] = []
         self._refresh_recent_save_actions()
 
         fm.addSeparator()
 
         # Default Save submenu
-        default_menu = fm.addMenu("Default Save")
-        self._set_default_save_action = QAction("Set Current as Default", self)
+        default_menu = fm.addMenu("默认存档")
+        self._set_default_save_action = QAction("设为默认", self)
         self._set_default_save_action.triggered.connect(self._set_current_as_default)
         self._set_default_save_action.setEnabled(False)
         default_menu.addAction(self._set_default_save_action)
 
-        self._clear_default_save_action = QAction("Clear Default", self)
+        self._clear_default_save_action = QAction("清除默认", self)
         self._clear_default_save_action.triggered.connect(self._clear_default_save)
         self._clear_default_save_action.setEnabled(False)
         default_menu.addAction(self._clear_default_save_action)
@@ -9413,38 +9413,38 @@ class MainWindow(QMainWindow):
         ra.triggered.connect(self._reload)
         fm.addAction(ra)
 
-        recalc = QAction("Recalculate Breeding Data", self)
+        recalc = QAction("重新计算育种数据", self)
         recalc.setShortcut("Ctrl+F5")
         recalc.setToolTip("Force full recomputation of breeding data (ignores disk cache)")
         recalc.triggered.connect(lambda: self._start_breeding_cache(self._cats, force_full=True) if self._cats else None)
         fm.addAction(recalc)
 
-        clear_cache = QAction("Clear Breeding Cache", self)
+        clear_cache = QAction("清除育种缓存", self)
         clear_cache.setToolTip("Delete the on-disk breeding cache for the current save file")
         clear_cache.triggered.connect(self._clear_breeding_cache)
         fm.addAction(clear_cache)
 
         fm.addSeparator()
 
-        exit_action = QAction("Exit", self)
+        exit_action = QAction("退出", self)
         exit_action.setShortcut("Alt+F4")
         exit_action.triggered.connect(self.close)
         fm.addAction(exit_action)
 
         sm = self.menuBar().addMenu("Settings")
-        locations_action = QAction("Locations…", self)
+        locations_action = QAction("路径设置…", self)
         locations_action.triggered.connect(self._open_locations_dialog)
         sm.addAction(locations_action)
 
         sm.addSeparator()
-        self._lineage_action = QAction("Show Family Tree && Inbreeding", self)
+        self._lineage_action = QAction("显示家谱与近亲数据", self)
         self._lineage_action.setCheckable(True)
         self._lineage_action.setChecked(False)
         self._lineage_action.triggered.connect(self._toggle_lineage)
         sm.addAction(self._lineage_action)
 
         sm.addSeparator()
-        zoom_in = QAction("Zoom In", self)
+        zoom_in = QAction("放大", self)
         zoom_in_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomIn)
         if not zoom_in_keys:
             zoom_in_keys = []
@@ -9455,7 +9455,7 @@ class MainWindow(QMainWindow):
         zoom_in.triggered.connect(lambda: self._change_zoom(+1))
         sm.addAction(zoom_in)
 
-        zoom_out = QAction("Zoom Out", self)
+        zoom_out = QAction("缩小", self)
         zoom_out_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.ZoomOut)
         if not zoom_out_keys:
             zoom_out_keys = []
@@ -9465,7 +9465,7 @@ class MainWindow(QMainWindow):
         zoom_out.triggered.connect(lambda: self._change_zoom(-1))
         sm.addAction(zoom_out)
 
-        zoom_reset = QAction("Reset Zoom", self)
+        zoom_reset = QAction("重置缩放", self)
         zoom_reset.setShortcut("Ctrl+0")
         zoom_reset.triggered.connect(self._reset_zoom)
         sm.addAction(zoom_reset)
@@ -9476,17 +9476,17 @@ class MainWindow(QMainWindow):
         self._update_zoom_info_action()
 
         sm.addSeparator()
-        fs_in = QAction("Increase Font Size", self)
+        fs_in = QAction("增大字体", self)
         fs_in.setShortcut("Ctrl+]")
         fs_in.triggered.connect(lambda: self._change_font_size(+1))
         sm.addAction(fs_in)
 
-        fs_out = QAction("Decrease Font Size", self)
+        fs_out = QAction("缩小字体", self)
         fs_out.setShortcut("Ctrl+[")
         fs_out.triggered.connect(lambda: self._change_font_size(-1))
         sm.addAction(fs_out)
 
-        fs_reset = QAction("Reset Font Size", self)
+        fs_reset = QAction("重置字体", self)
         fs_reset.setShortcut("Ctrl+\\")
         fs_reset.triggered.connect(lambda: self._set_font_size_offset(0))
         sm.addAction(fs_reset)
@@ -9519,19 +9519,19 @@ class MainWindow(QMainWindow):
 
     def _open_locations_dialog(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("Locations")
+        dlg.setWindowTitle("路径设置")
         dlg.setModal(True)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        game_title = QLabel("Game Install")
+        game_title = QLabel("游戏安装路径")
         game_title.setStyleSheet(_NAME_STYLE)
         game_path_label = QLabel()
         game_path_label.setWordWrap(True)
         game_path_label.setStyleSheet(_META_STYLE)
 
-        save_title = QLabel("Save Root")
+        save_title = QLabel("存档根目录")
         save_title.setStyleSheet(_NAME_STYLE)
         save_path_label = QLabel()
         save_path_label.setWordWrap(True)
@@ -9560,7 +9560,7 @@ class MainWindow(QMainWindow):
             )
             chosen_dir = QFileDialog.getExistingDirectory(
                 dlg,
-                "Select Mewgenics Install Folder",
+                "选择 Mewgenics 安装文件夹",
                 start_dir,
             )
             if not chosen_dir:
@@ -9569,8 +9569,8 @@ class MainWindow(QMainWindow):
             if not os.path.exists(gpak_path):
                 QMessageBox.warning(
                     dlg,
-                    "resources.gpak not found",
-                    "The selected folder does not contain resources.gpak.",
+                    "未找到 resources.gpak",
+                    "所选文件夹中未找到 resources.gpak。",
                 )
                 return
             _set_gpak_path(gpak_path)
@@ -9582,7 +9582,7 @@ class MainWindow(QMainWindow):
         def _choose_save_dir():
             chosen_dir = QFileDialog.getExistingDirectory(
                 dlg,
-                "Select Mewgenics Save Root",
+                "选择 Mewgenics 存档根目录",
                 _save_root_dir(),
             )
             if not chosen_dir:
@@ -9592,9 +9592,9 @@ class MainWindow(QMainWindow):
             self._refresh_recent_save_actions()
             self.statusBar().showMessage(f"Using save root {chosen_dir}")
 
-        game_btn = QPushButton("Change Game Folder…")
+        game_btn = QPushButton("更改游戏文件夹…")
         game_btn.clicked.connect(_choose_game_dir)
-        save_btn = QPushButton("Change Save Root…")
+        save_btn = QPushButton("更改存档根目录…")
         save_btn.clicked.connect(_choose_save_dir)
 
         layout.addWidget(game_title)
@@ -9653,14 +9653,14 @@ class MainWindow(QMainWindow):
                             " letter-spacing:1px; padding:8px 4px 4px 4px;")
             return l
 
-        vb.addWidget(sl("FILTERS"))
+        vb.addWidget(sl("筛选"))
         self._btn_everyone = _sidebar_btn("All Cats")
         self._btn_everyone.clicked.connect(
             lambda: self._filter("__all__", self._btn_everyone))
         vb.addWidget(self._btn_everyone)
         self._room_btns["__all__"] = self._btn_everyone
 
-        self._btn_all = _sidebar_btn("Alive Cats")
+        self._btn_all = _sidebar_btn("存活猫咪")
         self._btn_all.setChecked(True)
         self._active_btn = self._btn_all
         self._btn_all.clicked.connect(lambda: self._filter(None, self._btn_all))
@@ -9690,14 +9690,14 @@ class MainWindow(QMainWindow):
         self._room_btns["__donation__"] = self._btn_donation
 
         vb.addWidget(_hsep())
-        vb.addWidget(sl("BREEDING"))
-        self._btn_room_optimizer = _sidebar_btn("Room Optimizer")
+        vb.addWidget(sl("育种"))
+        self._btn_room_optimizer = _sidebar_btn("房间优化器")
         self._btn_room_optimizer.clicked.connect(self._open_room_optimizer)
         vb.addWidget(self._btn_room_optimizer)
-        self._btn_perfect_planner = _sidebar_btn("Perfect 7 Planner")
+        self._btn_perfect_planner = _sidebar_btn("完美七值规划器")
         self._btn_perfect_planner.clicked.connect(self._open_perfect_planner_view)
         vb.addWidget(self._btn_perfect_planner)
-        self._btn_mutation_planner = _sidebar_btn("Mutation Planner")
+        self._btn_mutation_planner = _sidebar_btn("变异规划器")
         self._btn_mutation_planner.clicked.connect(self._open_mutation_planner_view)
         vb.addWidget(self._btn_mutation_planner)
         self._btn_safe_breeding_view = _sidebar_btn("Safe Breeding")
@@ -9708,8 +9708,8 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_breeding_partners_view)
 
         vb.addWidget(_hsep())
-        vb.addWidget(sl("INFO"))
-        self._btn_tree_view = _sidebar_btn("Family Tree View")
+        vb.addWidget(sl("信息"))
+        self._btn_tree_view = _sidebar_btn("家谱视图")
         self._btn_tree_view.clicked.connect(self._open_tree_browser)
         vb.addWidget(self._btn_tree_view)
         self._btn_calibration = _sidebar_btn("Calibration")
@@ -9717,13 +9717,13 @@ class MainWindow(QMainWindow):
         vb.addWidget(self._btn_calibration)
 
         vb.addWidget(_hsep())
-        vb.addWidget(sl("ROOMS"))
+        vb.addWidget(sl("房间列表"))
         self._rooms_vb = QVBoxLayout(); self._rooms_vb.setSpacing(2)
         vb.addLayout(self._rooms_vb)
         vb.addWidget(_hsep())
 
-        vb.addWidget(sl("OTHER"))
-        self._btn_adventure = _sidebar_btn("On Adventure")
+        vb.addWidget(sl("其他"))
+        self._btn_adventure = _sidebar_btn("冒险中")
         self._btn_gone      = _sidebar_btn("Gone")
         self._btn_adventure.clicked.connect(
             lambda: self._filter("__adventure__", self._btn_adventure))
@@ -9741,7 +9741,7 @@ class MainWindow(QMainWindow):
         self._save_lbl.setWordWrap(True)
         vb.addWidget(self._save_lbl)
 
-        rb = QPushButton("⟳  Reload  (F5)")
+        rb = QPushButton("⟳  重新加载 (F5)")
         rb.setStyleSheet("QPushButton { color:#888; background:#1a1a32;"
                          " border:1px solid #2a2a4a; padding:7px;"
                          " border-radius:4px; font-size:11px; }"
@@ -9802,7 +9802,7 @@ class MainWindow(QMainWindow):
             "QPushButton:pressed { background:#4c241b; }"
             "QPushButton:checked { background:#7a3626; border:1px solid #b35b48; }"
         )
-        self._set_bulk_toggle_label(self._bulk_blacklist_btn, "Breeding Block", False)
+        self._set_bulk_toggle_label(self._bulk_blacklist_btn, "禁止育种", False)
         self._bulk_blacklist_btn.clicked.connect(self._toggle_blacklist_filtered_cats)
         self._bulk_must_breed_btn = QPushButton()
         self._bulk_must_breed_btn.setCheckable(True)
@@ -9814,7 +9814,7 @@ class MainWindow(QMainWindow):
             "QPushButton:pressed { background:#312c4f; }"
             "QPushButton:checked { background:#514890; border:1px solid #7d73c7; }"
         )
-        self._set_bulk_toggle_label(self._bulk_must_breed_btn, "Must Breed", False)
+        self._set_bulk_toggle_label(self._bulk_must_breed_btn, "必须育种", False)
         self._bulk_must_breed_btn.clicked.connect(self._toggle_must_breed_filtered_cats)
         bulk_container = QWidget()
         self._bulk_actions_layout = QHBoxLayout(bulk_container)
@@ -9823,7 +9823,7 @@ class MainWindow(QMainWindow):
         self._bulk_actions_layout.addWidget(self._bulk_must_breed_btn)
         self._bulk_actions_layout.addWidget(self._bulk_blacklist_btn)
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search cats, abilities, mutations…")
+        self._search.setPlaceholderText("搜索猫咪、能力、变异…")
         self._search.setClearButtonEnabled(True)
         self._search.setFixedWidth(self._base_search_width)
         self._search.setStyleSheet(
@@ -10703,7 +10703,7 @@ class MainWindow(QMainWindow):
             self._calibration_view.set_context(self._current_save, self._cats)
         self._update_count()
         self.statusBar().showMessage(
-            f"Calibration applied ({cal_explicit} explicit, {cal_token} token from {cal_rows} rows)"
+            f"校准已应用（{cal_explicit} 条显式，{cal_token} 条令牌，共 {cal_rows} 行）"
         )
 
     # ── Breeding cache ──────────────────────────────────────────────────
@@ -10772,14 +10772,14 @@ class MainWindow(QMainWindow):
         if os.path.exists(cp):
             try:
                 os.remove(cp)
-                self.statusBar().showMessage("Breeding cache cleared — next load will recompute from scratch")
+                self.statusBar().showMessage("育种缓存已清除 — 下次加载将重新计算")
             except OSError as e:
                 self.statusBar().showMessage(f"Could not delete cache: {e}")
         else:
             self.statusBar().showMessage("No on-disk breeding cache found for this save")
 
     def _on_phase1_ready(self, cache: BreedingCache):
-        """Ancestry computed — push to table and Safe Breeding so they're usable immediately."""
+        """血统计算完成 — 已推送至表格和安全育种视图，可立即使用。"""
         self._breeding_cache = cache
         self._source_model.set_breeding_cache(cache)
         if self._safe_breeding_view is not None:
@@ -11154,7 +11154,7 @@ class SaveSelectorDialog(QDialog):
         self._open_btn.setEnabled(len(saves) > 0)
         btn_row.addWidget(self._open_btn)
 
-        browse_btn = QPushButton("Browse…")
+        browse_btn = QPushButton("浏览…")
         browse_btn.setStyleSheet(
             "QPushButton { background:#1a1a32; color:#aaa; border:1px solid #2a2a4a; }"
             "QPushButton:hover { background:#252545; color:#ddd; }"
