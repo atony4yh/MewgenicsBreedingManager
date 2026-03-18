@@ -6120,10 +6120,10 @@ class RoomOptimizerCatLocator(QWidget):
 
             age_val = info.get("age")
             if isinstance(age_val, (int, float)):
-                age_item = QTableWidgetItem(f"{age_val:.2f}" if isinstance(age_val, float) else str(age_val))
+                age_item = _SortByUserRoleItem(f"{age_val:.2f}" if isinstance(age_val, float) else str(age_val))
                 age_item.setData(Qt.UserRole, float(age_val))
             else:
-                age_item = QTableWidgetItem(str(age_val) if age_val is not None else "?")
+                age_item = _SortByUserRoleItem(str(age_val) if age_val is not None else "?")
                 age_item.setData(Qt.UserRole, 0.0)
             age_item.setTextAlignment(Qt.AlignCenter)
 
